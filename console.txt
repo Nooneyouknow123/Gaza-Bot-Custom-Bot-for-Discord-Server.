@@ -1,0 +1,2 @@
+[2025-11-09 20:56:34] Bot initialized: Gaza Bot#0202 (ID: 1437057876370653285)
+[2025-11-09 20:56:35] Error during initialization: 403 Forbidden (error code: 50001): Missing Access

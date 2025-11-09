@@ -1,0 +1,13 @@
+
+--- 2025-11-09 20:56:35.009686 ---
+Command: on_ready
+Traceback (most recent call last):
+  File "c:\Users\hichkas\Desktop\gaza bot\main.py", line 72, in on_ready
+    await bot.tree.sync(guild=guild)
+  File "C:\Users\hichkas\AppData\Local\Programs\Python\Python313\Lib\site-packages\discord\app_commands\tree.py", line 1118, in sync
+    data = await self._http.bulk_upsert_guild_commands(self.client.application_id, guild.id, payload=payload)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hichkas\AppData\Local\Programs\Python\Python313\Lib\site-packages\discord\http.py", line 767, in request
+    raise Forbidden(response, data)
+discord.errors.Forbidden: 403 Forbidden (error code: 50001): Missing Access
+

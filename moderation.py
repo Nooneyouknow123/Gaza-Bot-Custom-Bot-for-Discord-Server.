@@ -1,5 +1,5 @@
 # moderation_cog.py
-# Moderation Cog (discord.py v2)
+# Moderation Cog (discord.py v2) with SQLite database
 # Features:
 #  - Prefix commands 
 #  - Warnings (add/list/remove/clear)
@@ -8,18 +8,17 @@
 #  - Jail role config + jail/unjail (stores/restores roles)
 #  - Mute/unmute using Discord's built-in timeout (Member.edit(timeout=...))
 #  - Ban/unban/kick
-#  - JSON persistence per-guild
-# Requirements: discord.py v2.x
+#  - SQLite database persistence
+# Requirements: discord.py v2.x, sqlite3
 # Usage: put in cogs folder and load as an extension
 
 import discord
 from discord.ext import commands, tasks
-import json
+import sqlite3
 import os
 import datetime
 import uuid
 import asyncio
-from typing import Optional
 from typing import Optional
 
 UNIT_MULTIPLIERS = {
@@ -27,47 +26,85 @@ UNIT_MULTIPLIERS = {
     "m": "minutes",
     "h": "hours",
     "d": "days"
-    }
+}
 
 MAX_MUTE_DAYS = 28  # Discord maximum timeout
 
+DB_FILE = "moderation_database.db"
 
-
-
-DATA_FILE = "moderation_data.json"  # saved relative to working dir
-
-
-
-
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def ensure_guild(data, guild_id):
-    gid = str(guild_id)
-    if gid not in data:
-        data[gid] = {
-            "staff_role": None,
-            "log_channel": None,
-            "jail_role": None,
-            "safelist": {"users": [], "roles": []},
-            "warnings": {},   # user_id -> list of warns
-            "notes": {},      # user_id -> list of notes
-            "jailed": {},     # user_id -> {roles: [ids], time, moderator, reason}
-        }
-    return data[gid]
-
+class Database:
+    def __init__(self):
+        self.db_file = DB_FILE
+        self._setup_db()
+    
+    def _setup_db(self):
+        """Initialize database with required tables"""
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        
+        # Guild settings table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id TEXT PRIMARY KEY,
+                staff_role TEXT,
+                log_channel TEXT,
+                jail_role TEXT
+            )
+        ''')
+        
+        # Safelist table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS safelist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT,
+                type TEXT, -- 'user' or 'role'
+                target_id TEXT,
+                UNIQUE(guild_id, type, target_id)
+            )
+        ''')
+        
+        # Warnings table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS warnings (
+                id TEXT PRIMARY KEY,
+                guild_id TEXT,
+                user_id TEXT,
+                moderator_id TEXT,
+                reason TEXT,
+                timestamp TEXT
+            )
+        ''')
+        
+        # Notes table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS notes (
+                id TEXT PRIMARY KEY,
+                guild_id TEXT,
+                user_id TEXT,
+                author_id TEXT,
+                note TEXT,
+                timestamp TEXT
+            )
+        ''')
+        
+        # Jailed users table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS jailed_users (
+                user_id TEXT,
+                guild_id TEXT,
+                roles_json TEXT, -- JSON array of role IDs
+                timestamp TEXT,
+                moderator_id TEXT,
+                reason TEXT,
+                PRIMARY KEY (user_id, guild_id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def get_connection(self):
+        return sqlite3.connect(self.db_file)
 
 def create_mod_embed(title: str, description: str, color: discord.Color = discord.Color.blurple()):
     e = discord.Embed(
@@ -79,55 +116,147 @@ def create_mod_embed(title: str, description: str, color: discord.Color = discor
     e.set_footer(text="Moderation System • v2")
     return e
 
-
 def create_error(msg: str):
     return create_mod_embed("Action Denied", msg, color=discord.Color.dark_red())
-
 
 def create_success(title: str, msg: str):
     return create_mod_embed(title, msg, color=discord.Color.green())
 
-
 class ModerationCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.data = load_data()
+        self.db = Database()
         self._save_lock = asyncio.Lock()
 
-    # ----------------- helpers -----------------
-    async def save(self):
-        async with self._save_lock:
-            save_data(self.data)
+    # ----------------- database helpers -----------------
+    async def execute_db(self, query: str, params: tuple = ()):
+        """Execute a database query asynchronously"""
+        def _execute():
+            conn = self.db.get_connection()
+            c = conn.cursor()
+            c.execute(query, params)
+            conn.commit()
+            result = c.lastrowid
+            conn.close()
+            return result
+        return await asyncio.get_event_loop().run_in_executor(None, _execute)
+    
+    async def fetchone_db(self, query: str, params: tuple = ()):
+        """Fetch one row from database asynchronously"""
+        def _fetch():
+            conn = self.db.get_connection()
+            c = conn.cursor()
+            c.execute(query, params)
+            result = c.fetchone()
+            conn.close()
+            return result
+        return await asyncio.get_event_loop().run_in_executor(None, _fetch)
+    
+    async def fetchall_db(self, query: str, params: tuple = ()):
+        """Fetch all rows from database asynchronously"""
+        def _fetch():
+            conn = self.db.get_connection()
+            c = conn.cursor()
+            c.execute(query, params)
+            result = c.fetchall()
+            conn.close()
+            return result
+        return await asyncio.get_event_loop().run_in_executor(None, _fetch)
 
-    def guild_conf(self, guild_id):
-        return ensure_guild(self.data, guild_id)
+    # ----------------- guild config helpers -----------------
+    async def get_guild_setting(self, guild_id: int, setting: str):
+        result = await self.fetchone_db(
+            "SELECT * FROM guild_settings WHERE guild_id = ?", 
+            (str(guild_id),)
+        )
+        if result:
+            # result: (guild_id, staff_role, log_channel, jail_role)
+            settings = {
+                'staff_role': result[1],
+                'log_channel': result[2],
+                'jail_role': result[3]
+            }
+            return settings.get(setting)
+        return None
 
+    async def set_guild_setting(self, guild_id: int, setting: str, value: str):
+        # Check if guild exists
+        existing = await self.fetchone_db(
+            "SELECT * FROM guild_settings WHERE guild_id = ?", 
+            (str(guild_id),)
+        )
+        
+        if existing:
+            # Update existing
+            if setting == 'staff_role':
+                await self.execute_db(
+                    "UPDATE guild_settings SET staff_role = ? WHERE guild_id = ?",
+                    (value, str(guild_id))
+                )
+            elif setting == 'log_channel':
+                await self.execute_db(
+                    "UPDATE guild_settings SET log_channel = ? WHERE guild_id = ?",
+                    (value, str(guild_id))
+                )
+            elif setting == 'jail_role':
+                await self.execute_db(
+                    "UPDATE guild_settings SET jail_role = ? WHERE guild_id = ?",
+                    (value, str(guild_id))
+                )
+        else:
+            # Insert new
+            staff = value if setting == 'staff_role' else None
+            log = value if setting == 'log_channel' else None
+            jail = value if setting == 'jail_role' else None
+            
+            await self.execute_db(
+                "INSERT INTO guild_settings (guild_id, staff_role, log_channel, jail_role) VALUES (?, ?, ?, ?)",
+                (str(guild_id), staff, log, jail)
+            )
+
+    # ----------------- staff check -----------------
     def is_staff(self, member: discord.Member):
         """Basic in-code check for staff: configured staff role OR Manage Messages / Kick Members."""
-        g = self.guild_conf(member.guild.id)
-        staff_role = g.get("staff_role")
-        if staff_role:
-            role = discord.utils.get(member.roles, id=int(staff_role))
-            if role:
+        # We'll get the staff role synchronously for this check
+        # For async operations, we'd need to adjust this
+        conn = self.db.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT staff_role FROM guild_settings WHERE guild_id = ?", (str(member.guild.id),))
+        result = c.fetchone()
+        conn.close()
+        
+        if result and result[0]:
+            staff_role = discord.utils.get(member.roles, id=int(result[0]))
+            if staff_role:
                 return True
+        
         # fallback on permissions
         perms = member.guild_permissions
         return perms.manage_messages or perms.kick_members or perms.ban_members
 
     async def is_protected(self, guild: discord.Guild, target: discord.Member):
-        g = self.guild_conf(guild.id)
-        safelist = g.get("safelist", {"users": [], "roles": []})
-        if str(target.id) in safelist.get("users", []):
+        # Check user safelist
+        user_result = await self.fetchone_db(
+            "SELECT * FROM safelist WHERE guild_id = ? AND type = 'user' AND target_id = ?",
+            (str(guild.id), str(target.id))
+        )
+        if user_result:
             return True
+        
+        # Check role safelist
         target_role_ids = {str(r.id) for r in target.roles}
-        for rid in safelist.get("roles", []):
-            if str(rid) in target_role_ids:
+        role_results = await self.fetchall_db(
+            "SELECT target_id FROM safelist WHERE guild_id = ? AND type = 'role'",
+            (str(guild.id),)
+        )
+        for result in role_results:
+            if result[0] in target_role_ids:
                 return True
+        
         return False
 
     async def log(self, guild: discord.Guild, embed: discord.Embed):
-        g = self.guild_conf(guild.id)
-        chan_id = g.get("log_channel")
+        chan_id = await self.get_guild_setting(guild.id, 'log_channel')
         if not chan_id:
             return
         channel = guild.get_channel(int(chan_id))
@@ -153,18 +282,14 @@ class ModerationCog(commands.Cog):
     @commands.command(name="setstaffrole")
     @commands.has_permissions(administrator=True)
     async def set_staff_role(self, ctx, role: discord.Role):
-        g = self.guild_conf(ctx.guild.id)
-        g["staff_role"] = str(role.id)
-        await self.save()
+        await self.set_guild_setting(ctx.guild.id, 'staff_role', str(role.id))
         await ctx.send(embed=create_success("Staff Role Set", f"Staff role set to {role.mention}"))
         await self.log(ctx.guild, create_mod_embed("Config", f"Staff role set to {role.name} ({role.id}) by {ctx.author}"))
 
     @commands.command(name="setlogchannel")
     @commands.has_permissions(administrator=True)
     async def set_log_channel(self, ctx, channel: discord.TextChannel):
-        g = self.guild_conf(ctx.guild.id)
-        g["log_channel"] = str(channel.id)
-        await self.save()
+        await self.set_guild_setting(ctx.guild.id, 'log_channel', str(channel.id))
         await ctx.send(embed=create_success("Log Channel Set", f"Log channel set to {channel.mention}"))
         await self.log(ctx.guild, create_mod_embed("Config", f"Log channel set to {channel.mention} by {ctx.author}"))
 
@@ -190,28 +315,37 @@ class ModerationCog(commands.Cog):
         if not role:
             await ctx.send(embed=create_error("Role not found. Use role ID, mention, or exact name."))
             return
-        g = self.guild_conf(ctx.guild.id)
-        g["jail_role"] = str(role.id)
-        await self.save()
+        
+        await self.set_guild_setting(ctx.guild.id, 'jail_role', str(role.id))
         await ctx.send(embed=create_success("Jail Role Set", f"Jail role set to {role.mention}"))
         await self.log(ctx.guild, create_mod_embed("Config", f"Jail role set to {role.name} ({role.id}) by {ctx.author}"))
 
     @commands.command(name="config")
     @staff_only()
     async def show_config(self, ctx):
-        g = self.guild_conf(ctx.guild.id)
-        staff = f"<not set>" if not g.get("staff_role") else f"<@&{g.get('staff_role')}>"
-        logc = f"<not set>" if not g.get("log_channel") else f"<#{g.get('log_channel')}>"
-        jail = f"<not set>" if not g.get("jail_role") else f"<@&{g.get('jail_role')}>"
-        safelist = g.get("safelist", {"users": [], "roles": []})
-        users = safelist.get("users", [])
-        roles = safelist.get("roles", [])
-        embed = create_mod_embed("Server Config", f"Staff role: {staff}\nLog channel: {logc}\nJail role: {jail}")
-        embed.add_field(name="Safelist - Users", value=", ".join(users) if users else "(none)", inline=False)
-        embed.add_field(name="Safelist - Roles", value=", ".join(roles) if roles else "(none)", inline=False)
+        staff = await self.get_guild_setting(ctx.guild.id, 'staff_role')
+        logc = await self.get_guild_setting(ctx.guild.id, 'log_channel')
+        jail = await self.get_guild_setting(ctx.guild.id, 'jail_role')
+        
+        staff_display = f"<not set>" if not staff else f"<@&{staff}>"
+        logc_display = f"<not set>" if not logc else f"<#{logc}>"
+        jail_display = f"<not set>" if not jail else f"<@&{jail}>"
+        
+        # Get safelist
+        users = await self.fetchall_db(
+            "SELECT target_id FROM safelist WHERE guild_id = ? AND type = 'user'",
+            (str(ctx.guild.id),)
+        )
+        roles = await self.fetchall_db(
+            "SELECT target_id FROM safelist WHERE guild_id = ? AND type = 'role'",
+            (str(ctx.guild.id),)
+        )
+        
+        embed = create_mod_embed("Server Config", f"Staff role: {staff_display}\nLog channel: {logc_display}\nJail role: {jail_display}")
+        embed.add_field(name="Safelist - Users", value=", ".join([u[0] for u in users]) if users else "(none)", inline=False)
+        embed.add_field(name="Safelist - Roles", value=", ".join([r[0] for r in roles]) if roles else "(none)", inline=False)
         await ctx.send(embed=embed)
 
-    
     # ---------------- SAFELIST COMMANDS ----------------
     @commands.group(name="safelist", invoke_without_command=True)
     @commands.has_permissions(administrator=True)
@@ -225,43 +359,53 @@ class ModerationCog(commands.Cog):
             "`!safelist list`"
         ))
 
-    def ensure_safelist(self, guild_id):
-        g = self.guild_conf(guild_id)
-        if "safelist" not in g:
-            g["safelist"] = {"users": [], "roles": []}
-        return g
-
     @safelist_group.command(name="add")
     @commands.has_permissions(administrator=True)
     async def safelist_add(self, ctx, *, target: str):
-        g = self.ensure_safelist(ctx.guild.id)
-        users = g["safelist"]["users"]
-        roles = g["safelist"]["roles"]
-        added = None
-
         target = target.strip().replace("<", "").replace(">", "").replace("@", "").replace("!", "").replace("&", "")
+        added = None
 
         # Try member
         member = ctx.guild.get_member(int(target)) if target.isdigit() else None
-        if member and str(member.id) not in users:
-            users.append(str(member.id))
-            added = f"user {member.mention}"
+        if member:
+            try:
+                await self.execute_db(
+                    "INSERT INTO safelist (guild_id, type, target_id) VALUES (?, 'user', ?)",
+                    (str(ctx.guild.id), str(member.id))
+                )
+                added = f"user {member.mention}"
+            except sqlite3.IntegrityError:
+                await ctx.send(embed=create_error("User is already in safelist."))
+                return
 
         # Try role
         elif target.isdigit():
             role = ctx.guild.get_role(int(target))
-            if role and str(role.id) not in roles:
-                roles.append(str(role.id))
-                added = f"role {role.mention}"
+            if role:
+                try:
+                    await self.execute_db(
+                        "INSERT INTO safelist (guild_id, type, target_id) VALUES (?, 'role', ?)",
+                        (str(ctx.guild.id), str(role.id))
+                    )
+                    added = f"role {role.mention}"
+                except sqlite3.IntegrityError:
+                    await ctx.send(embed=create_error("Role is already in safelist."))
+                    return
 
         # Try by name
         elif not target.isdigit():
             role = discord.utils.get(ctx.guild.roles, name=target)
-            if role and str(role.id) not in roles:
-                roles.append(str(role.id))
-                added = f"role {role.mention}"
+            if role:
+                try:
+                    await self.execute_db(
+                        "INSERT INTO safelist (guild_id, type, target_id) VALUES (?, 'role', ?)",
+                        (str(ctx.guild.id), str(role.id))
+                    )
+                    added = f"role {role.mention}"
+                except sqlite3.IntegrityError:
+                    await ctx.send(embed=create_error("Role is already in safelist."))
+                    return
 
-        await self.save()
         if added:
             await ctx.send(embed=create_success("Safelist Updated", f"✅ Added {added} to safelist."))
             await self.log(ctx.guild, create_mod_embed("Safelist", f"{ctx.author} added {added} to safelist."))
@@ -271,26 +415,28 @@ class ModerationCog(commands.Cog):
     @safelist_group.command(name="remove")
     @commands.has_permissions(administrator=True)
     async def safelist_remove(self, ctx, *, target: str):
-        g = self.ensure_safelist(ctx.guild.id)
-        users = g["safelist"]["users"]
-        roles = g["safelist"]["roles"]
+        target = target.strip().replace("<", "").replace(">", "").replace("@", "").replace("!", "").replace("&", "")
         removed = None
 
-        target = target.strip().replace("<", "").replace(">", "").replace("@", "").replace("!", "").replace("&", "")
+        # Try to remove by ID (user or role)
+        result = await self.execute_db(
+            "DELETE FROM safelist WHERE guild_id = ? AND target_id = ?",
+            (str(ctx.guild.id), target)
+        )
+        if result:
+            removed = f"ID {target}"
 
-        if target in users:
-            users.remove(target)
-            removed = f"user id {target}"
-        elif target in roles:
-            roles.remove(target)
-            removed = f"role id {target}"
-        else:
+        # Try by role name
+        if not removed:
             role = discord.utils.get(ctx.guild.roles, name=target)
-            if role and str(role.id) in roles:
-                roles.remove(str(role.id))
-                removed = f"role {role.mention}"
+            if role:
+                result = await self.execute_db(
+                    "DELETE FROM safelist WHERE guild_id = ? AND target_id = ?",
+                    (str(ctx.guild.id), str(role.id))
+                )
+                if result:
+                    removed = f"role {role.mention}"
 
-        await self.save()
         if removed:
             await ctx.send(embed=create_success("Safelist Updated", f"✅ Removed {removed} from safelist."))
             await self.log(ctx.guild, create_mod_embed("Safelist", f"{ctx.author} removed {removed} from safelist."))
@@ -300,19 +446,22 @@ class ModerationCog(commands.Cog):
     @safelist_group.command(name="list")
     @commands.has_permissions(administrator=True)
     async def safelist_list(self, ctx):
-        g = self.ensure_safelist(ctx.guild.id)
-        users = g["safelist"]["users"]
-        roles = g["safelist"]["roles"]
+        users = await self.fetchall_db(
+            "SELECT target_id FROM safelist WHERE guild_id = ? AND type = 'user'",
+            (str(ctx.guild.id),)
+        )
+        roles = await self.fetchall_db(
+            "SELECT target_id FROM safelist WHERE guild_id = ? AND type = 'role'",
+            (str(ctx.guild.id),)
+        )
+        
         lines = []
-
-        if users:
-            for uid in users:
-                member = ctx.guild.get_member(int(uid))
-                lines.append(f"👤 {member.mention if member else f'User ID: `{uid}`'}")
-        if roles:
-            for rid in roles:
-                role = ctx.guild.get_role(int(rid))
-                lines.append(f"🎭 {role.mention if role else f'Role ID: `{rid}`'}")
+        for uid in users:
+            member = ctx.guild.get_member(int(uid[0]))
+            lines.append(f"👤 {member.mention if member else f'User ID: `{uid[0]}`'}")
+        for rid in roles:
+            role = ctx.guild.get_role(int(rid[0]))
+            lines.append(f"🎭 {role.mention if role else f'Role ID: `{rid[0]}`'}")
 
         if not lines:
             lines = ["(none)"]
@@ -327,52 +476,61 @@ class ModerationCog(commands.Cog):
         if await self.is_protected(ctx.guild, member):
             await ctx.send(embed=create_error("Target is protected by safelist — action denied."))
             return
-        g = self.guild_conf(ctx.guild.id)
-        warns = g.setdefault("warnings", {})
-        user_warns = warns.setdefault(str(member.id), [])
+        
         wid = uuid.uuid4().hex[:8]
-        entry = {"id": wid, "moderator": str(ctx.author.id), "reason": reason, "time": datetime.datetime.utcnow().isoformat()}
-        user_warns.append(entry)
-        await self.save()
+        timestamp = datetime.datetime.utcnow().isoformat()
+        
+        await self.execute_db(
+            "INSERT INTO warnings (id, guild_id, user_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (wid, str(ctx.guild.id), str(member.id), str(ctx.author.id), reason, timestamp)
+        )
+        
         await ctx.send(embed=create_success("User Warned", f"{member.mention} was warned.\nID: `{wid}`\nReason: {reason}"))
         await self.log(ctx.guild, create_mod_embed("Warn", f"{ctx.author} warned {member} (ID: {wid}). Reason: {reason}"))
 
     @commands.command(name="warnlist")
     @staff_only()
     async def warnlist(self, ctx, member: discord.Member):
-        g = self.guild_conf(ctx.guild.id)
-        warns = g.get("warnings", {}).get(str(member.id), [])
+        warns = await self.fetchall_db(
+            "SELECT id, moderator_id, reason, timestamp FROM warnings WHERE guild_id = ? AND user_id = ?",
+            (str(ctx.guild.id), str(member.id))
+        )
+        
         if not warns:
             await ctx.send(embed=create_mod_embed("Warnings", f"{member.mention} has no warnings."))
             return
+        
         lines = []
         for w in warns:
-            mod = ctx.guild.get_member(int(w["moderator"]))
-            modname = mod.display_name if mod else w["moderator"]
-            lines.append(f"• ID: `{w['id']}` — {w['reason']} (by {modname} at {w['time']})")
+            mod = ctx.guild.get_member(int(w[1]))
+            modname = mod.display_name if mod else w[1]
+            lines.append(f"• ID: `{w[0]}` — {w[2]} (by {modname} at {w[3]})")
+        
         await ctx.send(embed=create_mod_embed(f"Warnings for {member}", "\n".join(lines)))
 
     @commands.command(name="removewarn")
     @staff_only()
     async def removewarn(self, ctx, member: discord.Member, warn_id: str):
-        g = self.guild_conf(ctx.guild.id)
-        warns = g.get("warnings", {}).get(str(member.id), [])
-        for w in warns:
-            if w["id"] == warn_id:
-                warns.remove(w)
-                await self.save()
-                await ctx.send(embed=create_success("Warning Removed", f"Removed warn `{warn_id}` from {member.mention}"))
-                await self.log(ctx.guild, create_mod_embed("Warn Removed", f"{ctx.author} removed warn `{warn_id}` from {member}."))
-                return
-        await ctx.send(embed=create_error("Warn ID not found for that user."))
+        result = await self.execute_db(
+            "DELETE FROM warnings WHERE guild_id = ? AND user_id = ? AND id = ?",
+            (str(ctx.guild.id), str(member.id), warn_id)
+        )
+        
+        if result:
+            await ctx.send(embed=create_success("Warning Removed", f"Removed warn `{warn_id}` from {member.mention}"))
+            await self.log(ctx.guild, create_mod_embed("Warn Removed", f"{ctx.author} removed warn `{warn_id}` from {member}."))
+        else:
+            await ctx.send(embed=create_error("Warn ID not found for that user."))
 
     @commands.command(name="clearwarns")
     @staff_only()
     async def clearwarns(self, ctx, member: discord.Member):
-        g = self.guild_conf(ctx.guild.id)
-        if str(member.id) in g.get("warnings", {}):
-            g["warnings"].pop(str(member.id), None)
-            await self.save()
+        result = await self.execute_db(
+            "DELETE FROM warnings WHERE guild_id = ? AND user_id = ?",
+            (str(ctx.guild.id), str(member.id))
+        )
+        
+        if result:
             await ctx.send(embed=create_success("Warnings Cleared", f"All warnings for {member.mention} have been cleared."))
             await self.log(ctx.guild, create_mod_embed("Warnings Cleared", f"{ctx.author} cleared warnings for {member}."))
         else:
@@ -382,21 +540,18 @@ class ModerationCog(commands.Cog):
     @commands.command(name="note")
     @staff_only()
     async def note(self, ctx, member: discord.Member, *, note_text: str):
-        g = self.guild_conf(ctx.guild.id)
-        notes = g.setdefault("notes", {})
-        user_notes = notes.setdefault(str(member.id), [])
         nid = uuid.uuid4().hex[:8]
-        entry = {"id": nid, "author": str(ctx.author.id), "note": note_text, "time": datetime.datetime.utcnow().isoformat()}
-        user_notes.append(entry)
-        await self.save()
+        timestamp = datetime.datetime.utcnow().isoformat()
+        
+        await self.execute_db(
+            "INSERT INTO notes (id, guild_id, user_id, author_id, note, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (nid, str(ctx.guild.id), str(member.id), str(ctx.author.id), note_text, timestamp)
+        )
+        
         await ctx.send(embed=create_success("Note Added", f"Note added to {member.mention} (ID: `{nid}`)."))
         await self.log(ctx.guild, create_mod_embed("Note", f"{ctx.author} added note to {member}: {note_text}"))
 
     # ----------------- mute/unmute using Discord timeout -----------------
-    import datetime
-
-    
-
     @commands.command(name="mute")
     @staff_only()
     async def mute(self, ctx, member: discord.Member, duration: Optional[str] = None, *, reason: Optional[str] = "No reason provided"):
@@ -443,8 +598,6 @@ class ModerationCog(commands.Cog):
         
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not mute user: {e}"))
-
-
 
     @commands.command(name="unmute")
     @staff_only()
@@ -510,17 +663,22 @@ class ModerationCog(commands.Cog):
         if await self.is_protected(ctx.guild, member):
             await ctx.send(embed=create_error("Target is protected by safelist — action denied."))
             return
-        g = self.guild_conf(ctx.guild.id)
-        jail_role_id = g.get("jail_role")
+        
+        jail_role_id = await self.get_guild_setting(ctx.guild.id, 'jail_role')
         if not jail_role_id:
             await ctx.send(embed=create_error("Jail role not set. Use `!jailrole <role_id>` to set it."))
             return
+        
         jail_role = ctx.guild.get_role(int(jail_role_id))
         if not jail_role:
             await ctx.send(embed=create_error("Configured jail role not found on this server. Set it again with `!jailrole`."))
             return
+        
         # Save current roles
         prev_roles = [r.id for r in member.roles if r != ctx.guild.default_role]
+        import json
+        roles_json = json.dumps(prev_roles)
+        
         try:
             # remove all roles except @everyone
             roles_to_remove = [r for r in member.roles if r != ctx.guild.default_role]
@@ -530,33 +688,38 @@ class ModerationCog(commands.Cog):
         except Exception as e:
             await ctx.send(embed=create_error(f"Failed to jail member: {e}"))
             return
-        g.setdefault("jailed", {})[str(member.id)] = {
-            "roles": prev_roles,
-            "time": datetime.datetime.utcnow().isoformat(),
-            "moderator": str(ctx.author.id),
-            "reason": reason
-        }
-        await self.save()
+        
+        timestamp = datetime.datetime.utcnow().isoformat()
+        await self.execute_db(
+            "INSERT OR REPLACE INTO jailed_users (user_id, guild_id, roles_json, timestamp, moderator_id, reason) VALUES (?, ?, ?, ?, ?, ?)",
+            (str(member.id), str(ctx.guild.id), roles_json, timestamp, str(ctx.author.id), reason)
+        )
+        
         await ctx.send(embed=create_success("Jailed", f"{member.mention} has been jailed.\nReason: {reason}"))
         await self.log(ctx.guild, create_mod_embed("Jail", f"{ctx.author} jailed {member}. Reason: {reason}"))
 
     @commands.command(name="unjail")
     @staff_only()
     async def unjail(self, ctx, member: discord.Member):
-        g = self.guild_conf(ctx.guild.id)
-        jailed = g.get("jailed", {})
-        entry = jailed.get(str(member.id))
-        if not entry:
+        result = await self.fetchone_db(
+            "SELECT roles_json FROM jailed_users WHERE user_id = ? AND guild_id = ?",
+            (str(member.id), str(ctx.guild.id))
+        )
+        
+        if not result:
             await ctx.send(embed=create_error("This user is not recorded as jailed."))
             return
-        prev_role_ids = entry.get("roles", [])
+        
+        import json
+        prev_role_ids = json.loads(result[0])
         roles_to_restore = []
         for rid in prev_role_ids:
             r = ctx.guild.get_role(int(rid))
             if r:
                 roles_to_restore.append(r)
+        
         try:
-            jail_role_id = g.get("jail_role")
+            jail_role_id = await self.get_guild_setting(ctx.guild.id, 'jail_role')
             if jail_role_id:
                 jail_r = ctx.guild.get_role(int(jail_role_id))
                 if jail_r and jail_r in member.roles:
@@ -566,8 +729,12 @@ class ModerationCog(commands.Cog):
         except Exception as e:
             await ctx.send(embed=create_error(f"Failed to unjail member: {e}"))
             return
-        g["jailed"].pop(str(member.id), None)
-        await self.save()
+        
+        await self.execute_db(
+            "DELETE FROM jailed_users WHERE user_id = ? AND guild_id = ?",
+            (str(member.id), str(ctx.guild.id))
+        )
+        
         await ctx.send(embed=create_success("Unjailed", f"{member.mention} has been unjailed and roles restored."))
         await self.log(ctx.guild, create_mod_embed("Unjail", f"{ctx.author} unjailed {member}."))
 
@@ -575,28 +742,30 @@ class ModerationCog(commands.Cog):
     @commands.command(name="whois")
     @staff_only()
     async def whois(self, ctx, member: discord.Member):
-        g = self.guild_conf(ctx.guild.id)
-        jailed = g.get("jailed", {}).get(str(member.id))
-        notes = g.get("notes", {}).get(str(member.id), [])
-        warns = g.get("warnings", {}).get(str(member.id), [])
+        # Check if jailed
+        jailed = await self.fetchone_db(
+            "SELECT * FROM jailed_users WHERE user_id = ? AND guild_id = ?",
+            (str(member.id), str(ctx.guild.id))
+        )
+        
+        # Count notes and warnings
+        notes_count = await self.fetchone_db(
+            "SELECT COUNT(*) FROM notes WHERE user_id = ? AND guild_id = ?",
+            (str(member.id), str(ctx.guild.id))
+        )
+        warns_count = await self.fetchone_db(
+            "SELECT COUNT(*) FROM warnings WHERE user_id = ? AND guild_id = ?",
+            (str(member.id), str(ctx.guild.id))
+        )
+        
         embed = create_mod_embed("Whois", f"Information for {member.mention}")
         embed.add_field(name="Name", value=f"{member} ({member.id})", inline=False)
         embed.add_field(name="Joined At", value=member.joined_at.isoformat() if member.joined_at else "Unknown", inline=True)
         embed.add_field(name="Roles", value=", ".join([r.name for r in member.roles if r != ctx.guild.default_role]) or "(none)", inline=False)
         embed.add_field(name="Jailed", value="Yes" if jailed else "No", inline=True)
-        embed.add_field(name="Notes", value=str(len(notes)), inline=True)
-        embed.add_field(name="Warnings", value=str(len(warns)), inline=True)
+        embed.add_field(name="Notes", value=str(notes_count[0]) if notes_count else "0", inline=True)
+        embed.add_field(name="Warnings", value=str(warns_count[0]) if warns_count else "0", inline=True)
         await ctx.send(embed=embed)
-
-    
-    # ----------------- cog unload/save on shutdown -----------------
-    def cog_unload(self):
-        # save data on unload
-        try:
-            save_data(self.data)
-        except Exception:
-            pass
-
 
 # ----------------- setup -----------------
 async def setup(bot: commands.Bot):
