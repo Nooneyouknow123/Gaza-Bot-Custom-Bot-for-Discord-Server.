@@ -157,8 +157,10 @@ async def on_ready():
 # -------------------- RUN BOT --------------------
 if __name__ == "__main__":
     try:
-        bot.run("YOUR_BOT_TOKEN_HERE")
+        bot.run("MTQzNzA1Nzg3NjM3MDY1MzI4NQ.GLK83i.HJTWx8Gc15xrMDqPkhTbM8EDDVZvixYDMO48CI
+")
     except Exception as e:
         print(f"{timestamp()} Failed to start bot: {e}")
         traceback.print_exc()
+
 
