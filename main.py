@@ -128,5 +128,31 @@ async def on_ready():
     await load_cogs()
     print(f"{timestamp()} Logged in as {bot.user} ({bot.user.id})")
 
+    # Set bot status
+    activity = discord.Activity(
+        type=discord.ActivityType.listening,
+        name="Multi-purpose Utility Bot for Gaza Guild."
+    )
+    await bot.change_presence(activity=activity)
+
+    # Sync slash commands after cogs load
+    try:
+        synced = await bot.tree.sync()
+        print(f"{timestamp()} Synced {len(synced)} slash command(s)")
+        for cmd in synced:
+            print(f"{timestamp()} - Synced command: {cmd.name}")
+    except Exception as e:
+        print(f"{timestamp()} Failed to sync commands: {e}")
+        traceback.print_exc()
+
+
+# -------------------- RUN BOT --------------------
+if __name__ == "__main__":
+    try:
+        bot.run("YOUR_BOT_TOKEN_HERE")
+    except Exception as e:
+        print(f"{timestamp()} Failed to start bot: {e}")
+        traceback.print_exc()
+
 # -------------------- RUN BOT --------------------
 bot.run("YOUR_BOT_TOKEN_HERE")
