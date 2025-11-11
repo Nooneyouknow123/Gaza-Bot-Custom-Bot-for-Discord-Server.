@@ -14,7 +14,7 @@
 
 import discord
 from discord.ext import commands, tasks
-import sqlite3
+import aiosqlite
 import os
 import datetime
 import uuid
@@ -32,18 +32,19 @@ MAX_MUTE_DAYS = 28  # Discord maximum timeout
 
 DB_FILE = "moderation_database.db"
 
+DB_FILE = "moderation_database.db"
+
 class Database:
     def __init__(self):
         self.db_file = DB_FILE
-        self._setup_db()
     
-    def _setup_db(self):
+    async def _setup_db(self):
         """Initialize database with required tables"""
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
+        conn = await aiosqlite.connect(self.db_file)
+        c = await conn.cursor()
         
         # Guild settings table
-        c.execute('''
+        await c.execute('''
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id TEXT PRIMARY KEY,
                 staff_role TEXT,
@@ -53,7 +54,7 @@ class Database:
         ''')
         
         # Safelist table
-        c.execute('''
+        await c.execute('''
             CREATE TABLE IF NOT EXISTS safelist (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id TEXT,
@@ -64,7 +65,7 @@ class Database:
         ''')
         
         # Warnings table
-        c.execute('''
+        await c.execute('''
             CREATE TABLE IF NOT EXISTS warnings (
                 id TEXT PRIMARY KEY,
                 guild_id TEXT,
@@ -76,7 +77,7 @@ class Database:
         ''')
         
         # Notes table
-        c.execute('''
+        await c.execute('''
             CREATE TABLE IF NOT EXISTS notes (
                 id TEXT PRIMARY KEY,
                 guild_id TEXT,
@@ -88,7 +89,7 @@ class Database:
         ''')
         
         # Jailed users table
-        c.execute('''
+        await c.execute('''
             CREATE TABLE IF NOT EXISTS jailed_users (
                 user_id TEXT,
                 guild_id TEXT,
@@ -100,11 +101,11 @@ class Database:
             )
         ''')
         
-        conn.commit()
-        conn.close()
+        await conn.commit()
+        await conn.close()
     
-    def get_connection(self):
-        return sqlite3.connect(self.db_file)
+    async def get_connection(self):
+        return await aiosqlite.connect(self.db_file)
 
 def create_mod_embed(title: str, description: str, color: discord.Color = discord.Color.blurple()):
     e = discord.Embed(
@@ -128,40 +129,45 @@ class ModerationCog(commands.Cog):
         self.db = Database()
         self._save_lock = asyncio.Lock()
 
+    async def cog_load(self):
+        """Initialize database when cog loads"""
+        await self.db._setup_db()
+
     # ----------------- database helpers -----------------
     async def execute_db(self, query: str, params: tuple = ()):
         """Execute a database query asynchronously"""
-        def _execute():
-            conn = self.db.get_connection()
-            c = conn.cursor()
-            c.execute(query, params)
-            conn.commit()
-            result = c.lastrowid
-            conn.close()
-            return result
-        return await asyncio.get_event_loop().run_in_executor(None, _execute)
+        conn = await self.db.get_connection()
+        try:
+            c = await conn.cursor()
+            await c.execute(query, params)
+            await conn.commit()
+            # Get the number of rows affected
+            changes = conn.total_changes
+            return changes
+        finally:
+            await conn.close()
     
     async def fetchone_db(self, query: str, params: tuple = ()):
         """Fetch one row from database asynchronously"""
-        def _fetch():
-            conn = self.db.get_connection()
-            c = conn.cursor()
-            c.execute(query, params)
-            result = c.fetchone()
-            conn.close()
+        conn = await self.db.get_connection()
+        try:
+            c = await conn.cursor()
+            await c.execute(query, params)
+            result = await c.fetchone()
             return result
-        return await asyncio.get_event_loop().run_in_executor(None, _fetch)
+        finally:
+            await conn.close()
     
     async def fetchall_db(self, query: str, params: tuple = ()):
         """Fetch all rows from database asynchronously"""
-        def _fetch():
-            conn = self.db.get_connection()
-            c = conn.cursor()
-            c.execute(query, params)
-            result = c.fetchall()
-            conn.close()
+        conn = await self.db.get_connection()
+        try:
+            c = await conn.cursor()
+            await c.execute(query, params)
+            result = await c.fetchall()
             return result
-        return await asyncio.get_event_loop().run_in_executor(None, _fetch)
+        finally:
+            await conn.close()
 
     # ----------------- guild config helpers -----------------
     async def get_guild_setting(self, guild_id: int, setting: str):
@@ -215,18 +221,13 @@ class ModerationCog(commands.Cog):
             )
 
     # ----------------- staff check -----------------
-    def is_staff(self, member: discord.Member):
+    async def is_staff(self, member: discord.Member):
         """Basic in-code check for staff: configured staff role OR Manage Messages / Kick Members."""
-        # We'll get the staff role synchronously for this check
-        # For async operations, we'd need to adjust this
-        conn = self.db.get_connection()
-        c = conn.cursor()
-        c.execute("SELECT staff_role FROM guild_settings WHERE guild_id = ?", (str(member.guild.id),))
-        result = c.fetchone()
-        conn.close()
+        # Get the staff role asynchronously
+        staff_role_id = await self.get_guild_setting(member.guild.id, 'staff_role')
         
-        if result and result[0]:
-            staff_role = discord.utils.get(member.roles, id=int(result[0]))
+        if staff_role_id:
+            staff_role = discord.utils.get(member.roles, id=int(staff_role_id))
             if staff_role:
                 return True
         
@@ -269,11 +270,11 @@ class ModerationCog(commands.Cog):
 
     # ----------------- checks -----------------
     def staff_only():
-        def predicate(ctx):
+        async def predicate(ctx):
             if ctx.guild is None:
                 raise commands.CheckFailure("This command must be used in a server.")
             cog: ModerationCog = ctx.cog
-            if cog.is_staff(ctx.author):
+            if await cog.is_staff(ctx.author):
                 return True
             raise commands.CheckFailure("You need the staff role or Manage Messages / Kick Members permission.")
         return commands.check(predicate)
@@ -374,7 +375,7 @@ class ModerationCog(commands.Cog):
                     (str(ctx.guild.id), str(member.id))
                 )
                 added = f"user {member.mention}"
-            except sqlite3.IntegrityError:
+            except Exception:  # Catch aiosqlite IntegrityError
                 await ctx.send(embed=create_error("User is already in safelist."))
                 return
 
@@ -388,7 +389,7 @@ class ModerationCog(commands.Cog):
                         (str(ctx.guild.id), str(role.id))
                     )
                     added = f"role {role.mention}"
-                except sqlite3.IntegrityError:
+                except Exception:  # Catch aiosqlite IntegrityError
                     await ctx.send(embed=create_error("Role is already in safelist."))
                     return
 
@@ -402,7 +403,7 @@ class ModerationCog(commands.Cog):
                         (str(ctx.guild.id), str(role.id))
                     )
                     added = f"role {role.mention}"
-                except sqlite3.IntegrityError:
+                except Exception:  # Catch aiosqlite IntegrityError
                     await ctx.send(embed=create_error("Role is already in safelist."))
                     return
 
@@ -423,7 +424,7 @@ class ModerationCog(commands.Cog):
             "DELETE FROM safelist WHERE guild_id = ? AND target_id = ?",
             (str(ctx.guild.id), target)
         )
-        if result:
+        if result > 0:  # FIX: Check if rows were actually affected
             removed = f"ID {target}"
 
         # Try by role name
@@ -434,7 +435,7 @@ class ModerationCog(commands.Cog):
                     "DELETE FROM safelist WHERE guild_id = ? AND target_id = ?",
                     (str(ctx.guild.id), str(role.id))
                 )
-                if result:
+                if result > 0:  # FIX: Check if rows were actually affected
                     removed = f"role {role.mention}"
 
         if removed:
@@ -511,30 +512,46 @@ class ModerationCog(commands.Cog):
     @commands.command(name="removewarn")
     @staff_only()
     async def removewarn(self, ctx, member: discord.Member, warn_id: str):
-        result = await self.execute_db(
+        # FIX: Check if the warning exists first
+        existing_warn = await self.fetchone_db(
+            "SELECT id FROM warnings WHERE guild_id = ? AND user_id = ? AND id = ?",
+            (str(ctx.guild.id), str(member.id), warn_id)
+        )
+        
+        if not existing_warn:
+            await ctx.send(embed=create_error("Warn ID not found for that user."))
+            return
+        
+        # Delete the warning
+        await self.execute_db(
             "DELETE FROM warnings WHERE guild_id = ? AND user_id = ? AND id = ?",
             (str(ctx.guild.id), str(member.id), warn_id)
         )
         
-        if result:
-            await ctx.send(embed=create_success("Warning Removed", f"Removed warn `{warn_id}` from {member.mention}"))
-            await self.log(ctx.guild, create_mod_embed("Warn Removed", f"{ctx.author} removed warn `{warn_id}` from {member}."))
-        else:
-            await ctx.send(embed=create_error("Warn ID not found for that user."))
+        await ctx.send(embed=create_success("Warning Removed", f"Removed warn `{warn_id}` from {member.mention}"))
+        await self.log(ctx.guild, create_mod_embed("Warn Removed", f"{ctx.author} removed warn `{warn_id}` from {member}."))
 
     @commands.command(name="clearwarns")
     @staff_only()
     async def clearwarns(self, ctx, member: discord.Member):
+        # Check if there are any warnings first
+        existing_warns = await self.fetchone_db(
+            "SELECT COUNT(*) FROM warnings WHERE guild_id = ? AND user_id = ?",
+            (str(ctx.guild.id), str(member.id))
+        )
+        
+        if not existing_warns or existing_warns[0] == 0:
+            await ctx.send(embed=create_mod_embed("Warnings", f"{member.mention} has no warnings."))
+            return
+        
         result = await self.execute_db(
             "DELETE FROM warnings WHERE guild_id = ? AND user_id = ?",
             (str(ctx.guild.id), str(member.id))
         )
         
-        if result:
+        if result > 0:
             await ctx.send(embed=create_success("Warnings Cleared", f"All warnings for {member.mention} have been cleared."))
             await self.log(ctx.guild, create_mod_embed("Warnings Cleared", f"{ctx.author} cleared warnings for {member}."))
-        else:
-            await ctx.send(embed=create_mod_embed("Warnings", f"{member.mention} has no warnings."))
 
     # ----------------- notes -----------------
     @commands.command(name="note")

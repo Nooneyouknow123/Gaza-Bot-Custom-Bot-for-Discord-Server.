@@ -4,7 +4,7 @@
 
 import discord
 from discord.ext import commands
-import sqlite3
+import aiosqlite
 import os
 import datetime
 import traceback
@@ -15,10 +15,10 @@ VALID_CATEGORIES = ["message", "member", "role", "channel", "emoji", "voice", "m
 
 # -------------------- DATABASE --------------------
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
+async def init_db():
+    conn = await aiosqlite.connect(DB_FILE)
+    c = await conn.cursor()
+    await c.execute('''
         CREATE TABLE IF NOT EXISTS guild_logs (
             guild_id TEXT PRIMARY KEY,
             message_channel TEXT,
@@ -31,19 +31,19 @@ def init_db():
             audit_channel TEXT
         )
     ''')
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await conn.close()
 
 
-def load_data():
+async def load_data():
     if not os.path.exists(DB_FILE):
-        init_db()
+        await init_db()
         return {}
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    conn = await aiosqlite.connect(DB_FILE)
+    c = await conn.cursor()
     data = {}
-    c.execute('SELECT * FROM guild_logs')
-    rows = c.fetchall()
+    await c.execute('SELECT * FROM guild_logs')
+    rows = await c.fetchall()
     for row in rows:
         guild_id = row[0]
         data[guild_id] = {
@@ -58,17 +58,17 @@ def load_data():
                 "audit": row[8]
             }
         }
-    conn.close()
+    await conn.close()
     return data
 
 
-def save_data(data):
-    init_db()
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+async def save_data(data):
+    await init_db()
+    conn = await aiosqlite.connect(DB_FILE)
+    c = await conn.cursor()
     for guild_id, guild_data in data.items():
         channels = guild_data.get("channels", {})
-        c.execute('''
+        await c.execute('''
             INSERT OR REPLACE INTO guild_logs 
             (guild_id, message_channel, member_channel, role_channel, channel_channel, emoji_channel, voice_channel, mod_channel, audit_channel)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -83,8 +83,8 @@ def save_data(data):
             channels.get("mod"),
             channels.get("audit")
         ))
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await conn.close()
 
 
 def ensure_guild(data, guild_id):
@@ -102,7 +102,7 @@ def ensure_guild(data, guild_id):
 # -------------------- EMBED HELPERS --------------------
 
 def create_log_embed(title: str, description: str, color: discord.Color = discord.Color.blurple(), icon: Optional[str] = None, author: Optional[discord.abc.User] = None, thumbnail: Optional[str] = None):
-    e = discord.Embed(title=(f"{icon} {title}" if icon else title), description=description, color=color, timestamp=datetime.datetime.datetime.utcnow())
+    e = discord.Embed(title=(f"{icon} {title}" if icon else title), description=description, color=color, timestamp=datetime.datetime.utcnow())
     footer_text = "🛡️ Server Logs • Advanced Logging System"
     e.set_footer(text=footer_text)
     if author:
@@ -135,11 +135,14 @@ def create_field_section(embed: discord.Embed, title: str, value: str, inline: b
 class LogsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.data = load_data()
+        self.data = {}
+
+    async def cog_load(self):
+        self.data = await load_data()
 
     async def save(self):
         try:
-            save_data(self.data)
+            await save_data(self.data)
         except Exception:
             traceback.print_exc()
 
@@ -463,12 +466,12 @@ class LogsCog(commands.Cog):
         print(f"[LogsCog] Internal error in {event_method}:")
         traceback.print_exc()
 
-    def cog_unload(self):
+    async def cog_unload(self):
         try:
-            save_data(self.data)
+            await save_data(self.data)
         except Exception:
             traceback.print_exc()
 
 async def setup(bot: commands.Bot):
-    init_db()
+    await init_db()
     await bot.add_cog(LogsCog(bot))
