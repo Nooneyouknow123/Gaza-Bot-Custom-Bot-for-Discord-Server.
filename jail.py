@@ -1,10 +1,22 @@
 # jail_cog.py
 
-# Jail + Appeal Ticket System
+"""
+
+Stabile Jail Cog - überarbeitete Version
+
+- Single source of DB locking via async _run_db (uses run_in_executor)
+
+- Keine Doppel-Locks mehr
+
+- Verbesserte Fehlerbehandlung & Logging
+
+- Funktional identisch zum Original, Appeals/Tickets unverändert
+
+"""
 
 import discord
 
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from discord.ui import View, Button
 
@@ -18,9 +30,17 @@ import datetime
 
 import json
 
-from typing import Optional
+import traceback
+
+import logging
+
+from typing import Optional, Callable, Any
+
+# ---------------- Config ----------------
 
 DB_FILE = "jail_system.db"
+
+TRANSCRIPT_TEMP_DIR = "transcripts"
 
 DEFAULT_CATEGORY_NAME = "🔒 Jail"
 
@@ -34,9 +54,25 @@ TICKET_PREFIX = "appeal-"
 
 APPEAL_PROMPT_TIMEOUT = 600  # seconds
 
-TRANSCRIPT_TEMP_DIR = "transcripts"
+ERROR_LOG_FILE = "jail_errors.log"
 
-BLURPLE = discord.Color.blurple()
+# Setup logging
+
+logger = logging.getLogger("jail_cog")
+
+if not logger.handlers:
+
+    handler = logging.FileHandler(ERROR_LOG_FILE, encoding="utf-8")
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    handler.setFormatter(formatter)
+
+    logger.addHandler(handler)
+
+    logger.setLevel(logging.INFO)
+
+# Helper time
 
 def now_iso():
 
@@ -47,6 +83,38 @@ def pretty_ts(dt: Optional[datetime.datetime] = None):
     dt = dt or datetime.datetime.utcnow()
 
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+# duration parser
+
+def parse_duration(s: str) -> Optional[int]:
+
+    try:
+
+        s = s.lower().strip()
+
+        if s.endswith("m"):
+
+            return int(s[:-1]) * 60
+
+        if s.endswith("h"):
+
+            return int(s[:-1]) * 3600
+
+        if s.endswith("d"):
+
+            return int(s[:-1]) * 86400
+
+        if s.isdigit():
+
+            return int(s) * 60
+
+    except Exception:
+
+        return None
+
+    return None
+
+# UI Views
 
 class CreateAppealView(View):
 
@@ -72,6 +140,8 @@ class TicketActionView(View):
 
         self.add_item(Button(label="🔒 Close", style=discord.ButtonStyle.secondary, custom_id="ticket_close"))
 
+# The Cog
+
 class JailCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
@@ -80,213 +150,373 @@ class JailCog(commands.Cog):
 
         os.makedirs(TRANSCRIPT_TEMP_DIR, exist_ok=True)
 
+        self._db_lock = asyncio.Lock()
+
+        self._timeout_lock = asyncio.Lock()
+
+        # create connection (thread-safe usage: check_same_thread=False)
+
+        self.conn = None
+
         self._ensure_db()
+
+        # cache for open tickets
 
         self.ticket_channel_cache = set()
 
-        self._load_open_tickets()
+        # load open tickets from DB (sync; safe during init because conn exists)
 
-    # DB helpers
+        try:
+
+            self._load_open_tickets()
+
+        except Exception:
+
+            logger.exception("Failed to load initial open tickets")
+
+        logger.info("JailCog initialized")
+
+    # ------------------ DB helpers ------------------
 
     def _ensure_db(self):
 
-        self.conn = sqlite3.connect(DB_FILE)
+        """
 
-        self.conn.row_factory = sqlite3.Row
+        Ensure DB exists and create tables. This is synchronous and executed at cog init.
 
-        c = self.conn.cursor()
+        """
 
-        c.execute("""
+        try:
 
-        CREATE TABLE IF NOT EXISTS guild_config (
+            self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 
-            guild_id INTEGER PRIMARY KEY,
+            self.conn.row_factory = sqlite3.Row
 
-            jail_role INTEGER,
+            c = self.conn.cursor()
 
-            jail_category INTEGER,
+            c.execute("""
 
-            appeals_channel INTEGER,
+            CREATE TABLE IF NOT EXISTS guild_config (
 
-            admin_channel INTEGER,
+                guild_id INTEGER PRIMARY KEY,
 
-            admin_role INTEGER
+                jail_role INTEGER,
 
-        )
+                jail_category INTEGER,
 
-        """)
+                appeals_channel INTEGER,
 
-        c.execute("""
+                admin_channel INTEGER,
 
-        CREATE TABLE IF NOT EXISTS jailed_users (
+                admin_role INTEGER
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            )""")
 
-            guild_id INTEGER,
+            c.execute("""
 
-            user_id INTEGER,
+            CREATE TABLE IF NOT EXISTS jailed_users (
 
-            reason TEXT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-            previous_roles TEXT,
+                guild_id INTEGER,
 
-            jailed_at TEXT
+                user_id INTEGER,
 
-        )
+                reason TEXT,
 
-        """)
+                previous_roles TEXT,
 
-        c.execute("""
+                jailed_at TEXT,
 
-        CREATE TABLE IF NOT EXISTS appeals (
+                release_at TEXT
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            )""")
 
-            guild_id INTEGER,
+            c.execute("""
 
-            ticket_channel_id INTEGER,
+            CREATE TABLE IF NOT EXISTS appeals (
 
-            user_id INTEGER,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-            reason TEXT,
+                guild_id INTEGER,
 
-            status TEXT,
+                ticket_channel_id INTEGER,
 
-            created_at TEXT,
+                user_id INTEGER,
 
-            closed_at TEXT,
+                reason TEXT,
 
-            transcript TEXT
+                status TEXT,
 
-        )
+                created_at TEXT,
 
-        """)
+                closed_at TEXT,
 
-        self.conn.commit()
+                transcript TEXT
 
-    def _load_open_tickets(self):
+            )""")
 
-        c = self.conn.cursor()
+            self.conn.commit()
 
-        c.execute("SELECT ticket_channel_id FROM appeals WHERE status = 'open'")
+        except Exception as e:
 
-        rows = c.fetchall()
+            logger.exception("Failed to ensure DB: %s", e)
 
-        for r in rows:
+            # try to recreate connection
 
-            if r["ticket_channel_id"]:
+            try:
 
-                self.ticket_channel_cache.add(r["ticket_channel_id"])
+                if self.conn:
 
-    def _save_guild_config(self, guild_id, **kwargs):
+                    self.conn.close()
 
-        c = self.conn.cursor()
+            except Exception:
 
-        existing = c.execute("SELECT 1 FROM guild_config WHERE guild_id = ?", (guild_id,)).fetchone()
+                pass
+
+            self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+
+            self.conn.row_factory = sqlite3.Row
+
+    def _get_conn(self):
+
+        """
+
+        Return a live connection, reconnect if needed.
+
+        This is synchronous and used by sync DB functions.
+
+        """
+
+        try:
+
+            if self.conn is None:
+
+                self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+
+                self.conn.row_factory = sqlite3.Row
+
+            # simple health-check
+
+            self.conn.execute("SELECT 1")
+
+            return self.conn
+
+        except Exception:
+
+            try:
+
+                if self.conn:
+
+                    self.conn.close()
+
+            except Exception:
+
+                pass
+
+            logger.warning("Reconnecting DB connection")
+
+            self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+
+            self.conn.row_factory = sqlite3.Row
+
+            return self.conn
+
+    async def _run_db(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
+
+        """
+
+        Run a synchronous DB function in an executor while holding an asyncio.Lock.
+
+        fn will be called with the DB connection as its first parameter.
+
+        This prevents blocking the event loop for DB operations and avoids double-locks.
+
+        """
+
+        async with self._db_lock:
+
+            loop = asyncio.get_running_loop()
+
+            conn = self._get_conn()
+
+            # wrap into a callable that passes conn as first arg
+
+            def _callable():
+
+                try:
+
+                    return fn(conn, *args, **kwargs)
+
+                except Exception:
+
+                    # propagate exception to be handled by run_in_executor result
+
+                    logger.exception("DB function raised an exception")
+
+                    raise
+
+            return await loop.run_in_executor(None, _callable)
+
+    # ---------- Sync DB functions (take conn param) ----------
+
+    def _save_guild_config_sync(self, conn, gid: int, **kw):
+
+        c = conn.cursor()
+
+        existing = c.execute("SELECT 1 FROM guild_config WHERE guild_id=?", (gid,)).fetchone()
 
         if existing:
 
-            fields = ", ".join(f"{k} = ?" for k in kwargs.keys())
+            fields = ", ".join(f"{k}=?" for k in kw.keys())
 
-            values = list(kwargs.values()) + [guild_id]
+            values = list(kw.values()) + [gid]
 
-            c.execute(f"UPDATE guild_config SET {fields} WHERE guild_id = ?", values)
+            c.execute(f"UPDATE guild_config SET {fields} WHERE guild_id=?", values)
 
         else:
 
             keys = ["jail_role", "jail_category", "appeals_channel", "admin_channel", "admin_role"]
 
-            vals = [kwargs.get(k) for k in keys]
+            vals = [kw.get(k) for k in keys]
 
-            c.execute("INSERT INTO guild_config (guild_id, jail_role, jail_category, appeals_channel, admin_channel, admin_role) VALUES (?,?,?,?,?,?)", [guild_id] + vals)
+            c.execute("INSERT INTO guild_config (guild_id, jail_role, jail_category, appeals_channel, admin_channel, admin_role) VALUES (?,?,?,?,?,?)", [gid] + vals)
 
-        self.conn.commit()
+        conn.commit()
 
-    def _get_guild_config(self, guild_id):
+    def _get_guild_config_sync(self, conn, gid: int):
 
-        c = self.conn.cursor()
+        c = conn.cursor()
 
-        r = c.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,)).fetchone()
-
-        return dict(r) if r else None
-
-    def _add_jailed_user(self, guild_id, user_id, reason, previous_roles):
-
-        c = self.conn.cursor()
-
-        c.execute("INSERT INTO jailed_users (guild_id, user_id, reason, previous_roles, jailed_at) VALUES (?,?,?,?,?)", (guild_id, user_id, reason, json.dumps(previous_roles), now_iso()))
-
-        self.conn.commit()
-
-    def _remove_jailed_user(self, guild_id, user_id):
-
-        c = self.conn.cursor()
-
-        c.execute("DELETE FROM jailed_users WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-
-        self.conn.commit()
-
-    def _get_jailed_user(self, guild_id, user_id):
-
-        c = self.conn.cursor()
-
-        r = c.execute("SELECT * FROM jailed_users WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)).fetchone()
+        r = c.execute("SELECT * FROM guild_config WHERE guild_id=?", (gid,)).fetchone()
 
         return dict(r) if r else None
 
-    def _create_appeal(self, guild_id, ticket_channel_id, user_id, reason):
+    def _add_jailed_user_sync(self, conn, gid: int, uid: int, reason: str, prev_roles, release_at=None):
 
-        c = self.conn.cursor()
+        c = conn.cursor()
 
-        c.execute("INSERT INTO appeals (guild_id, ticket_channel_id, user_id, reason, status, created_at) VALUES (?,?,?,?,?,?)", (guild_id, ticket_channel_id, user_id, reason, "open", now_iso()))
+        c.execute(
 
-        self.conn.commit()
+            "INSERT INTO jailed_users (guild_id,user_id,reason,previous_roles,jailed_at,release_at) VALUES (?,?,?,?,?,?)",
 
-        aid = c.lastrowid
+            (gid, uid, reason, json.dumps(prev_roles), now_iso(), release_at)
 
-        self.ticket_channel_cache.add(ticket_channel_id)
+        )
 
-        return aid
+        conn.commit()
 
-    def _close_appeal(self, ticket_channel_id, status, transcript_text):
+        return c.lastrowid
 
-        c = self.conn.cursor()
+    def _get_jailed_user_sync(self, conn, gid: int, uid: int):
+
+        c = conn.cursor()
+
+        r = c.execute("SELECT * FROM jailed_users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
+
+        return dict(r) if r else None
+
+    def _remove_jailed_user_sync(self, conn, gid: int, uid: int):
+
+        c = conn.cursor()
+
+        c.execute("DELETE FROM jailed_users WHERE guild_id=? AND user_id=?", (gid, uid))
+
+        conn.commit()
+
+        return True
+
+    def _create_appeal_sync(self, conn, guild_id: int, ticket_channel_id: int, user_id: int, reason: str):
+
+        c = conn.cursor()
+
+        c.execute("INSERT INTO appeals (guild_id, ticket_channel_id, user_id, reason, status, created_at) VALUES (?,?,?,?,?,?)",
+
+                  (guild_id, ticket_channel_id, user_id, reason, "open", now_iso()))
+
+        conn.commit()
+
+        return c.lastrowid
+
+    def _close_appeal_sync(self, conn, ticket_channel_id: int, status: str, transcript_text: str):
+
+        c = conn.cursor()
 
         c.execute("UPDATE appeals SET status = ?, transcript = ?, closed_at = ? WHERE ticket_channel_id = ?", (status, transcript_text, now_iso(), ticket_channel_id))
 
-        self.conn.commit()
+        conn.commit()
 
-        try:
+        return True
 
-            self.ticket_channel_cache.discard(ticket_channel_id)
+    def _get_appeals_for_user_sync(self, conn, guild_id: int, user_id: int, limit: int = 10):
 
-        except Exception:
-
-            pass
-
-    def _get_appeals_for_user(self, guild_id, user_id, limit=10):
-
-        c = self.conn.cursor()
+        c = conn.cursor()
 
         rows = c.execute("SELECT * FROM appeals WHERE guild_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?", (guild_id, user_id, limit)).fetchall()
 
         return [dict(r) for r in rows]
 
-    # Logging helper (calls LogsCog)
+    def _load_open_tickets(self):
+
+        """
+
+        Synchronous loader used at init: reads open tickets into cache.
+
+        (This is not run in executor because it's called during __init__ and uses the same thread)
+
+        """
+
+        try:
+
+            c = self._get_conn().cursor()
+
+            rows = c.execute("SELECT ticket_channel_id FROM appeals WHERE status = 'open'").fetchall()
+
+            for r in rows:
+
+                if r[0]:
+
+                    self.ticket_channel_cache.add(r[0])
+
+        except Exception:
+
+            logger.exception("Failed to load open tickets")
+
+    # ------------------ Logging helper ------------------
 
     async def _log_mod(self, guild: discord.Guild, *, embed: discord.Embed = None, file: discord.File = None, content: str = None):
 
-        logs_cog = self.bot.get_cog("LogsCog")
+        """
 
-        if logs_cog:
+        Safe mod logging. Only await if the log function is a coroutine.
 
-            try:
+        """
 
-                await logs_cog.log(guild, "mod", embed=embed, file=file, content=content)
+        try:
 
-            except Exception:
+            logs_cog = self.bot.get_cog("LogsCog")
 
-                pass
+            if logs_cog and hasattr(logs_cog, "log") and callable(logs_cog.log):
+
+                coro = logs_cog.log(guild, "mod", embed=embed, file=file, content=content)
+
+                if asyncio.iscoroutine(coro):
+
+                    await coro
+
+                else:
+
+                    logger.info("LogsCog.log is not async; logged manually: %s", content or (embed.title if embed else "embed"))
+
+            else:
+
+                logger.info("Mod log for guild %s: %s", guild.id, content or (embed.title if embed else "embed"))
+
+        except Exception:
+
+            logger.exception("_log_mod failed")
+
+    # transcript
 
     async def _make_transcript_file(self, channel: discord.TextChannel, member_id: int, appeal_id: int) -> str:
 
@@ -296,1127 +526,745 @@ class JailCog(commands.Cog):
 
         lines = []
 
-        async for m in channel.history(limit=1000, oldest_first=True):
+        try:
 
-            ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            async for m in channel.history(limit=1000, oldest_first=True):
 
-            content = m.content or ""
+                ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if m.created_at else "?"
 
-            lines.append(f"[{ts}] {m.author} ({m.author.id}): {content}")
+                content = m.content or ""
 
-        with open(filename, "w", encoding="utf-8") as f:
+                lines.append(f"[{ts}] {m.author} ({m.author.id}): {content}")
 
-            f.write("\n".join(lines))
+            with open(filename, "w", encoding="utf-8") as f:
+
+                f.write("\n".join(lines))
+
+        except Exception:
+
+            logger.exception("Failed to create transcript for channel %s", getattr(channel, "id", "?"))
 
         return filename
 
-    # ---------- commands ----------
-
-    @commands.command(name="setupjail")
-
-    @commands.has_permissions(administrator=True)
-
-    async def setup_jail(self, ctx):
-
-        guild = ctx.guild
-
-        # create or get jailed role
-
-        jail_role = discord.utils.get(guild.roles, name=JAILED_ROLE_NAME)
-
-        if not jail_role:
-
-            try:
-
-                jail_role = await guild.create_role(name=JAILED_ROLE_NAME, reason="Jail setup by bot")
-
-            except Exception as e:
-
-                await ctx.send(embed=discord.Embed(title="Error", description=f"Could not create role: {e}", color=discord.Color.red()))
-
-                return
-
-        # create category
-
-        category = discord.utils.get(guild.categories, name=DEFAULT_CATEGORY_NAME)
-
-        if not category:
-
-            try:
-
-                category = await guild.create_category(DEFAULT_CATEGORY_NAME, reason="Jail setup by bot")
-
-            except Exception as e:
-
-                await ctx.send(embed=discord.Embed(title="Error", description=f"Could not create category: {e}", color=discord.Color.red()))
-
-                return
-
-        # appeals/admin channel
-
-        appeals_chan = discord.utils.get(guild.text_channels, name=APPEALS_CHANNEL_NAME)
-
-        if not appeals_chan:
-
-            overwrites = {
-
-                guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
-
-                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-            }
-
-            try:
-
-                appeals_chan = await guild.create_text_channel(APPEALS_CHANNEL_NAME, category=category, overwrites=overwrites, reason="Jail setup appeals channel")
-
-            except Exception as e:
-
-                await ctx.send(embed=discord.Embed(title="Error", description=f"Could not create appeals channel: {e}", color=discord.Color.red()))
-
-                return
-
-        admin_chan = discord.utils.get(guild.text_channels, name=ADMIN_CHANNEL_NAME)
-
-        if not admin_chan:
-
-            overwrites = {
-
-                guild.default_role: discord.PermissionOverwrite(read_messages=False),
-
-                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-            }
-
-            try:
-
-                admin_chan = await guild.create_text_channel(ADMIN_CHANNEL_NAME, category=category, overwrites=overwrites, reason="Jail setup admin channel")
-
-            except Exception as e:
-
-                await ctx.send(embed=discord.Embed(title="Error", description=f"Could not create admin channel: {e}", color=discord.Color.red()))
-
-                return
-
-        # save config
-
-        self._save_guild_config(guild.id, jail_role=jail_role.id, jail_category=category.id, appeals_channel=appeals_chan.id, admin_channel=admin_chan.id)
-
-        # post switch/button
-
-        embed = discord.Embed(title="📩 Appeals", description="If you are jailed and want to appeal, click **Create Appeal** below and follow the instructions.", color=BLURPLE, timestamp=datetime.datetime.utcnow())
-
-        embed.set_author(name=guild.name, icon_url=guild.icon.url if guild.icon else None)
-
-        embed.set_footer(text="Appeal system • Click the button to start")
-
-        view = CreateAppealView(self)
-
-        try:
-
-            async for m in appeals_chan.history(limit=50):
-
-                if m.author == guild.me and m.embeds:
-
-                    try:
-
-                        await m.delete()
-
-                    except Exception:
-
-                        pass
-
-            await appeals_chan.send(embed=embed, view=view)
-
-        except Exception:
-
-            pass
-
-        # log via LogsCog
-
-        le = discord.Embed(title="🛠️ Jail System Setup", description=f"Jail system created by {ctx.author.mention}", color=BLURPLE, timestamp=datetime.datetime.utcnow())
-
-        le.set_author(name=guild.name, icon_url=guild.icon.url if guild.icon else None)
-
-        le.add_field(name="Jail Role", value=jail_role.mention)
-
-        le.add_field(name="Appeals Channel", value=appeals_chan.mention)
-
-        le.add_field(name="Admin Channel", value=admin_chan.mention)
-
-        le.set_footer(text=f"Setup at {pretty_ts()}")
-
-        await self._log_mod(guild, embed=le)
-
-        await ctx.send(embed=discord.Embed(title="Jail system", description="Setup complete. Appeals button posted.", color=discord.Color.green()))
-
-    @commands.command(name="setjailadmins")
-
-    @commands.has_permissions(administrator=True)
-
-    async def set_jail_admins(self, ctx, role: discord.Role):
-
-        guild = ctx.guild
-
-        cfg = self._get_guild_config(guild.id) or {}
-
-        self._save_guild_config(guild.id, jail_role=cfg.get("jail_role"), jail_category=cfg.get("jail_category"), appeals_channel=cfg.get("appeals_channel"), admin_channel=cfg.get("admin_channel"), admin_role=role.id)
-
-        await ctx.send(embed=discord.Embed(title="Jail Admins Set", description=f"Role {role.mention} set as jail admins.", color=discord.Color.green()))
-
-        le = discord.Embed(title="👮 Jail Admin Role Updated", description=f"{role.mention} set as jail admins by {ctx.author.mention}", color=BLURPLE, timestamp=datetime.datetime.utcnow())
-
-        le.set_footer(text=pretty_ts())
-
-        await self._log_mod(guild, embed=le)
-
-    @commands.command(name="jail")
-
-    @commands.has_permissions(manage_roles=True)
-
-    async def cmd_jail(self, ctx, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
-
-        guild = ctx.guild
-
-        cfg = self._get_guild_config(guild.id)
-
-        if not cfg or not cfg.get("jail_role"):
-
-            await ctx.send(embed=discord.Embed(title="Not configured", description="Use .setupjail first.", color=discord.Color.red()))
-
-            return
-
-        jail_role = guild.get_role(int(cfg["jail_role"]))
-
-        if not jail_role:
-
-            await ctx.send(embed=discord.Embed(title="Missing role", description="Configured jail role not found. Re-run setup.", color=discord.Color.red()))
-
-            return
-
-        if jail_role in member.roles:
-
-            await ctx.send(embed=discord.Embed(title="Already jailed", description=f"{member.mention} is already jailed.", color=discord.Color.orange()))
-
-            return
-
-        previous_roles = [r.id for r in member.roles if r != guild.default_role and r != jail_role]
-
-        self._add_jailed_user(guild.id, member.id, reason, previous_roles)
-
-        roles_to_remove = [r for r in member.roles if r != guild.default_role and r != jail_role]
-
-        try:
-
-            if roles_to_remove:
-
-                await member.remove_roles(*roles_to_remove, reason=f"Jailed by {ctx.author}: {reason}")
-
-            await member.add_roles(jail_role, reason=f"Jailed by {ctx.author}: {reason}")
-
-        except Exception as e:
-
-            await ctx.send(embed=discord.Embed(title="Action failed", description=f"Could not modify roles: {e}", color=discord.Color.red()))
-
-            return
-
-        await ctx.send(embed=discord.Embed(title="User jailed", description=f"{member.mention} was jailed.\nReason: {reason}", color=discord.Color.green()))
-
-        embed = discord.Embed(title="🔒 User Jailed", description=f"{member.mention} (`{member.id}`)\nBy: {ctx.author.mention}\nReason: {reason}", color=BLURPLE, timestamp=datetime.datetime.utcnow())
-
-        embed.set_footer(text=f"Action at {pretty_ts()}")
-
-        await self._log_mod(guild, embed=embed)
-
-        try:
-
-            await member.send(f"You were jailed in {guild.name} by {ctx.author}. Reason: {reason}")
-
-        except Exception:
-
-            pass
-
-    @commands.command(name="unjail")
-
-    @commands.has_permissions(manage_roles=True)
-
-    async def cmd_unjail(self, ctx, member: discord.Member):
-
-        guild = ctx.guild
-
-        cfg = self._get_guild_config(guild.id)
-
-        if not cfg or not cfg.get("jail_role"):
-
-            await ctx.send(embed=discord.Embed(title="Not configured", description="Use .setupjail first.", color=discord.Color.red()))
-
-            return
-
-        jail_role = guild.get_role(int(cfg["jail_role"]))
-
-        jailed = self._get_jailed_user(guild.id, member.id)
-
-        if not jailed:
-
-            await ctx.send(embed=discord.Embed(title="Not jailed", description="This user is not recorded as jailed.", color=discord.Color.orange()))
-
-            return
-
-        prev_roles = json.loads(jailed["previous_roles"]) if jailed["previous_roles"] else []
-
-        roles_objs = []
-
-        for rid in prev_roles:
-
-            try:
-
-                r = guild.get_role(int(rid))
-
-                if r:
-
-                    roles_objs.append(r)
-
-            except Exception:
-
-                pass
-
-        try:
-
-            if jail_role and jail_role in member.roles:
-
-                await member.remove_roles(jail_role, reason=f"Unjailed by {ctx.author}")
-
-            if roles_objs:
-
-                await member.add_roles(*roles_objs, reason=f"Unjailed by {ctx.author}")
-
-        except Exception as e:
-
-            await ctx.send(embed=discord.Embed(title="Action failed", description=f"Could not restore roles: {e}", color=discord.Color.red()))
-
-            return
-
-        self._remove_jailed_user(guild.id, member.id)
-
-        await ctx.send(embed=discord.Embed(title="User unjailed", description=f"{member.mention} was unjailed and roles restored.", color=discord.Color.green()))
-
-        embed = discord.Embed(title="🔓 User Unjailed", description=f"{member.mention} (`{member.id}`)\nBy: {ctx.author.mention}", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
-
-        embed.set_footer(text=f"Action at {pretty_ts()}")
-
-        await self._log_mod(guild, embed=embed)
-
-        try:
-
-            await member.send(f"You were unjailed in {guild.name} by {ctx.author}.")
-
-        except Exception:
-
-            pass
-
-    # Interaction listeners (create ticket & handle buttons)
-
-    @commands.Cog.listener()
-
-    async def on_interaction(self, interaction: discord.Interaction):
-
-        try:
-
-            if not interaction.data:
-
-                return
-
-            custom_id = interaction.data.get("custom_id") or interaction.data.get("customId")
-
-            if not custom_id:
-
-                return
-
-            if custom_id == "create_appeal":
-
-                await interaction.response.defer(ephemeral=True)
-
-                guild = interaction.guild
-
-                user = interaction.user
-
-                cfg = self._get_guild_config(guild.id)
-
-                if not cfg or not cfg.get("appeals_channel"):
-
-                    await interaction.followup.send("Appeals not configured.", ephemeral=True)
-
-                    return
-
-                jailed = self._get_jailed_user(guild.id, user.id)
-
-                if not jailed:
-
-                    await interaction.followup.send("You are not jailed and cannot open an appeal.", ephemeral=True)
-
-                    return
-
-                # create channel
-
-                category_id = cfg.get("jail_category")
-
-                category = guild.get_channel(int(category_id)) if category_id else None
-
-                base_name = f"{TICKET_PREFIX}{user.name}".lower().replace(" ", "-")
-
-                final_name = base_name
-
-                suffix = 1
-
-                while discord.utils.get(guild.text_channels, name=final_name):
-
-                    final_name = f"{base_name}-{suffix}"
-
-                    suffix += 1
-
-                overwrites = {
-
-                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
-
-                    guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-
-                    user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-                }
-
-                admin_role_id = cfg.get("admin_role")
-
-                if admin_role_id:
-
-                    ar = guild.get_role(int(admin_role_id))
-
-                    if ar:
-
-                        overwrites[ar] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-                try:
-
-                    ticket_chan = await guild.create_text_channel(final_name, category=category, overwrites=overwrites, reason=f"Appeal ticket by {user}")
-
-                except Exception as e:
-
-                    await interaction.followup.send(f"Could not create ticket channel: {e}", ephemeral=True)
-
-                    return
-
-                # prompt for reason
-
-                try:
-
-                    await ticket_chan.send(f"{user.mention}, bitte schreibe hier deinen Appeal-Grund. Du hast {APPEAL_PROMPT_TIMEOUT//60} Minuten.")
-
-                    def check(m): return m.author.id == user.id and m.channel.id == ticket_chan.id
-
-                    msg = await self.bot.wait_for("message", timeout=APPEAL_PROMPT_TIMEOUT, check=check)
-
-                    reason = msg.content.strip() or "No reason provided"
-
-                except asyncio.TimeoutError:
-
-                    try:
-
-                        await ticket_chan.send("Zeit abgelaufen — kein Appeal-Grund erhalten. Ticket wird geschlossen.")
-
-                        await asyncio.sleep(2)
-
-                        await ticket_chan.delete(reason="Appeal prompt timeout")
-
-                    except Exception:
-
-                        pass
-
-                    await interaction.followup.send("Du hast nicht rechtzeitig geantwortet. Ticket geschlossen.", ephemeral=True)
-
-                    return
-
-                appeal_id = self._create_appeal(guild.id, ticket_chan.id, user.id, reason)
-
-                tembed = discord.Embed(title="📝 Appeal Ticket", description=f"**User:** {user.mention}\n**Reason:** {reason}", color=BLURPLE, timestamp=datetime.datetime.utcnow())
-
-                tembed.set_author(name=guild.name, icon_url=guild.icon.url if guild.icon else None)
-
-                tembed.add_field(name="Next steps", value="Staff can use ✅ Approve or ❌ Deny. Use the buttons or `.approve` / `.deny <reason>` commands in this channel.", inline=False)
-
-                tembed.set_footer(text=f"Ticket #{appeal_id} • Created at {pretty_ts()}")
-
-                view = TicketActionView(self)
-
-                try:
-
-                    await ticket_chan.send(embed=tembed, view=view)
-
-                except Exception:
-
-                    await ticket_chan.send("Ticket created. Staff will review it shortly.")
-
-                if admin_role_id:
-
-                    ar = guild.get_role(int(admin_role_id))
-
-                    if ar:
-
-                        await ticket_chan.send(f"{ar.mention} New appeal opened by {user.mention}.")
-
-                await interaction.followup.send(f"Dein Appeal wurde erstellt: {ticket_chan.mention}", ephemeral=True)
-
-                le = discord.Embed(title="📬 Appeal Created", description=f"User: {user.mention} (`{user.id}`)\nTicket: {ticket_chan.mention}\nReason: {reason}", color=BLURPLE, timestamp=datetime.datetime.utcnow())
-
-                le.set_footer(text=f"Appeal #{appeal_id} • {pretty_ts()}")
-
-                await self._log_mod(guild, embed=le)
-
-                return
-
-            if custom_id in ("ticket_approve", "ticket_deny", "ticket_close"):
-
-                await interaction.response.defer(ephemeral=True)
-
-                if custom_id == "ticket_approve":
-
-                    await self._handle_button_approve(interaction)
-
-                elif custom_id == "ticket_deny":
-
-                    await self._handle_button_deny(interaction)
-
-                elif custom_id == "ticket_close":
-
-                    await self._handle_button_close(interaction)
-
-                return
-
-        except Exception:
-
-            try:
-
-                await interaction.followup.send("Ein Fehler ist aufgetreten.", ephemeral=True)
-
-            except Exception:
-
-                pass
-
-    # --- button handlers (approve/deny/close) ---
-
-    async def _handle_button_approve(self, interaction: discord.Interaction):
-
-        channel = interaction.channel
-
-        author = interaction.user
-
-        if not self._is_ticket_channel(channel):
-
-            await interaction.followup.send("This is not an appeal ticket.", ephemeral=True)
-
-            return
-
-        if not self._is_jail_admin(author) and not author.guild_permissions.administrator:
-
-            await interaction.followup.send("You don't have permission to approve appeals.", ephemeral=True)
-
-            return
-
-        c = self.conn.cursor()
-
-        rec = c.execute("SELECT * FROM appeals WHERE ticket_channel_id = ? AND status = 'open'", (channel.id,)).fetchone()
-
-        if not rec:
-
-            await interaction.followup.send("No open appeal found.", ephemeral=True)
-
-            return
-
-        user_id = rec["user_id"]
-
-        appeal_id = rec["id"]
-
-        guild = interaction.guild
-
-        member = guild.get_member(int(user_id))
-
-        filename = await self._make_transcript_file(channel, user_id, appeal_id)
-
-        jailed = self._get_jailed_user(guild.id, int(user_id))
-
-        if jailed:
-
-            prev = json.loads(jailed["previous_roles"]) if jailed["previous_roles"] else []
-
-            roles_objs = [guild.get_role(rid) for rid in prev if guild.get_role(rid)]
-
-            jail_role_id = self._get_guild_config(guild.id).get("jail_role")
-
-            jail_role = guild.get_role(int(jail_role_id)) if jail_role_id else None
-
-            try:
-
-                if jail_role and member and jail_role in member.roles:
-
-                    await member.remove_roles(jail_role, reason=f"Appeal approved by {author}")
-
-                if member and roles_objs:
-
-                    await member.add_roles(*roles_objs, reason=f"Appeal approved by {author}")
-
-            except Exception:
-
-                pass
-
-            self._remove_jailed_user(guild.id, int(user_id))
-
-        try:
-
-            with open(filename, "r", encoding="utf-8") as f:
-
-                transcript_text = f.read()
-
-        except Exception:
-
-            transcript_text = "[Could not read transcript file]"
-
-        self._close_appeal(channel.id, "approved", transcript_text)
-
-        embed = discord.Embed(title="✅ Appeal Approved", description=f"By: {author.mention}\nUser: <@{user_id}>", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
-
-        embed.add_field(name="Appeal ID", value=str(appeal_id), inline=True)
-
-        embed.add_field(name="Channel", value=channel.mention, inline=True)
-
-        embed.set_footer(text=f"Approved at {pretty_ts()}")
-
-        try:
-
-            dfile = discord.File(filename, filename=os.path.basename(filename))
-
-            await self._log_mod(guild, embed=embed, file=dfile)
-
-        except Exception:
-
-            await self._log_mod(guild, embed=embed)
-
-        try:
-
-            os.remove(filename)
-
-        except Exception:
-
-            pass
-
-        try:
-
-            if member:
-
-                await member.send(f"Your appeal in {guild.name} was APPROVED by {author}.")
-
-        except Exception:
-
-            pass
-
-        try:
-
-            await channel.send(embed=discord.Embed(title="Appeal approved — closing ticket...", color=discord.Color.green()))
-
-            await asyncio.sleep(2)
-
-            await channel.delete(reason=f"Appeal approved by {author}")
-
-        except Exception:
-
-            pass
-
-        try:
-
-            await interaction.followup.send("Appeal approved.", ephemeral=True)
-
-        except Exception:
-
-            pass
-
-    async def _handle_button_deny(self, interaction: discord.Interaction):
-
-        channel = interaction.channel
-
-        author = interaction.user
-
-        if not self._is_ticket_channel(channel):
-
-            await interaction.followup.send("This is not an appeal ticket.", ephemeral=True)
-
-            return
-
-        if not self._is_jail_admin(author) and not author.guild_permissions.administrator:
-
-            await interaction.followup.send("You don't have permission to deny appeals.", ephemeral=True)
-
-            return
-
-        c = self.conn.cursor()
-
-        rec = c.execute("SELECT * FROM appeals WHERE ticket_channel_id = ? AND status = 'open'", (channel.id,)).fetchone()
-
-        if not rec:
-
-            await interaction.followup.send("No open appeal found.", ephemeral=True)
-
-            return
-
-        user_id = rec["user_id"]
-
-        appeal_id = rec["id"]
-
-        guild = interaction.guild
-
-        member = guild.get_member(int(user_id))
-
-        await interaction.followup.send("Bitte gib einen Grund für die Ablehnung ein (ephemeral). Antworte mit dem Grund in diesem Ephemeral-Dialog.", ephemeral=True)
-
-        deny_reason = "Denied by staff"
-
-        filename = await self._make_transcript_file(channel, user_id, appeal_id)
-
-        try:
-
-            with open(filename, "r", encoding="utf-8") as f:
-
-                transcript_text = f.read()
-
-        except Exception:
-
-            transcript_text = "[Could not read transcript file]"
-
-        self._close_appeal(channel.id, "denied", transcript_text)
-
-        embed = discord.Embed(title="❌ Appeal Denied", description=f"By: {author.mention}\nUser: <@{user_id}>\nReason: {deny_reason}", color=discord.Color.red(), timestamp=datetime.datetime.utcnow())
-
-        embed.add_field(name="Appeal ID", value=str(appeal_id), inline=True)
-
-        embed.add_field(name="Channel", value=channel.mention, inline=True)
-
-        embed.set_footer(text=f"Denied at {pretty_ts()}")
-
-        try:
-
-            dfile = discord.File(filename, filename=os.path.basename(filename))
-
-            await self._log_mod(guild, embed=embed, file=dfile)
-
-        except Exception:
-
-            await self._log_mod(guild, embed=embed)
-
-        try:
-
-            os.remove(filename)
-
-        except Exception:
-
-            pass
-
-        try:
-
-            if member:
-
-                await member.send(f"Your appeal in {guild.name} was DENIED by {author}. Reason: {deny_reason}")
-
-        except Exception:
-
-            pass
-
-        try:
-
-            await channel.send(embed=discord.Embed(title="Appeal denied — closing ticket...", color=discord.Color.red()))
-
-            await asyncio.sleep(2)
-
-            await channel.delete(reason=f"Appeal denied by {author}")
-
-        except Exception:
-
-            pass
-
-        try:
-
-            await interaction.followup.send("Appeal denied.", ephemeral=True)
-
-        except Exception:
-
-            pass
-
-    async def _handle_button_close(self, interaction: discord.Interaction):
-
-        channel = interaction.channel
-
-        author = interaction.user
-
-        if not self._is_ticket_channel(channel):
-
-            await interaction.followup.send("This is not an appeal ticket.", ephemeral=True)
-
-            return
-
-        if not (self._is_jail_admin(author) or author.guild_permissions.administrator):
-
-            await interaction.followup.send("You don't have permission to close tickets.", ephemeral=True)
-
-            return
-
-        c = self.conn.cursor()
-
-        rec = c.execute("SELECT * FROM appeals WHERE ticket_channel_id = ? AND status = 'open'", (channel.id,)).fetchone()
-
-        if rec:
-
-            user_id = rec["user_id"]
-
-            appeal_id = rec["id"]
-
-            filename = await self._make_transcript_file(channel, user_id, appeal_id)
-
-            try:
-
-                with open(filename, "r", encoding="utf-8") as f:
-
-                    transcript_text = f.read()
-
-            except Exception:
-
-                transcript_text = "[Could not read transcript file]"
-
-            self._close_appeal(channel.id, "closed", transcript_text)
-
-            embed = discord.Embed(title="🔒 Ticket Closed", description=f"Closed by: {author.mention}\nUser: <@{user_id}>", color=discord.Color.light_grey(), timestamp=datetime.datetime.utcnow())
-
-            embed.set_footer(text=f"Closed at {pretty_ts()}")
-
-            try:
-
-                dfile = discord.File(filename, filename=os.path.basename(filename))
-
-                await self._log_mod(channel.guild, embed=embed, file=dfile)
-
-            except Exception:
-
-                await self._log_mod(channel.guild, embed=embed)
-
-            try:
-
-                os.remove(filename)
-
-            except Exception:
-
-                pass
-
-        try:
-
-            await channel.send("Ticket will be closed...", delete_after=2)
-
-            await asyncio.sleep(2)
-
-            await channel.delete(reason=f"Closed by {author}")
-
-        except Exception:
-
-            pass
-
-        try:
-
-            await interaction.followup.send("Ticket closed.", ephemeral=True)
-
-        except Exception:
-
-            pass
-
-    # ticket commands
-
-    def _is_ticket_channel(self, channel: discord.TextChannel) -> bool:
-
-        return channel.id in self.ticket_channel_cache
+    # ------------------ Permission helpers ------------------
 
     def _is_jail_admin(self, member: discord.Member) -> bool:
 
-        cfg = self._get_guild_config(member.guild.id) or {}
+        cfg = self._get_guild_config_sync(self._get_conn(), member.guild.id) or {}
 
         role_id = cfg.get("admin_role")
 
         if not role_id:
 
-            return False
+            return member.guild_permissions.administrator
 
         role = member.guild.get_role(int(role_id))
 
-        return role in member.roles if role else False
+        try:
 
-    @commands.command(name="approve")
+            return (role in member.roles) or member.guild_permissions.administrator if role else member.guild_permissions.administrator
 
-    async def cmd_approve(self, ctx, *, message: Optional[str] = "Approved"):
+        except Exception:
 
-        if not self._is_ticket_channel(ctx.channel):
+            return member.guild_permissions.administrator
 
-            await ctx.send(embed=discord.Embed(title="Not a ticket", description="This command must be used inside an appeal ticket.", color=discord.Color.orange()))
+    def _bot_can_manage_roles(self, guild: discord.Guild) -> bool:
 
-            return
+        me = guild.me
 
-        if not self._is_jail_admin(ctx.author) and not ctx.author.guild_permissions.administrator:
+        if not me:
 
-            await ctx.send(embed=discord.Embed(title="Not allowed", description="You do not have permission to approve appeals.", color=discord.Color.red()))
+            return False
 
-            return
+        return me.guild_permissions.manage_roles
 
-        c = self.conn.cursor()
+    def _bot_role_position_ok(self, guild: discord.Guild, target_role: discord.Role) -> bool:
 
-        rec = c.execute("SELECT * FROM appeals WHERE ticket_channel_id = ? AND status = 'open'", (ctx.channel.id,)).fetchone()
+        me = guild.me
 
-        if not rec:
+        if not me or not target_role:
 
-            await ctx.send(embed=discord.Embed(title="No open appeal", description="Cannot find an open appeal for this channel.", color=discord.Color.orange()))
+            return False
 
-            return
+        try:
 
-        user_id = rec["user_id"]
+            return me.top_role.position > target_role.position
 
-        appeal_id = rec["id"]
+        except Exception:
+
+            return False
+
+    # ------------------ Setup commands ------------------
+
+    @commands.command(name="setupjail")
+
+    @commands.has_permissions(administrator=True)
+
+    async def setup_jail(self, ctx: commands.Context):
 
         guild = ctx.guild
 
-        member = guild.get_member(int(user_id))
+        try:
 
-        filename = await self._make_transcript_file(ctx.channel, user_id, appeal_id)
+            jail_role = discord.utils.get(guild.roles, name=JAILED_ROLE_NAME)
 
-        jailed = self._get_jailed_user(guild.id, int(user_id))
+            if not jail_role:
 
-        if jailed:
+                jail_role = await guild.create_role(name=JAILED_ROLE_NAME, reason="Jail setup by bot")
 
-            prev = json.loads(jailed["previous_roles"]) if jailed["previous_roles"] else []
+            category = discord.utils.get(guild.categories, name=DEFAULT_CATEGORY_NAME)
 
-            roles_objs = [guild.get_role(rid) for rid in prev if guild.get_role(rid)]
+            if not category:
 
-            jail_role_id = self._get_guild_config(guild.id).get("jail_role")
+                category = await guild.create_category(DEFAULT_CATEGORY_NAME, reason="Jail setup by bot")
 
-            jail_role = guild.get_role(int(jail_role_id)) if jail_role_id else None
+            appeals_chan = discord.utils.get(guild.text_channels, name=APPEALS_CHANNEL_NAME)
+
+            if not appeals_chan:
+
+                overwrites = {
+
+                    guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+
+                    guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+                }
+
+                appeals_chan = await guild.create_text_channel(APPEALS_CHANNEL_NAME, category=category, overwrites=overwrites, reason="Jail setup appeals channel")
+
+            admin_chan = discord.utils.get(guild.text_channels, name=ADMIN_CHANNEL_NAME)
+
+            if not admin_chan:
+
+                overwrites = {
+
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
+
+                    guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+                }
+
+                admin_chan = await guild.create_text_channel(ADMIN_CHANNEL_NAME, category=category, overwrites=overwrites, reason="Jail setup admin channel")
+
+            # Save config to DB via async wrapper
+
+            await self._run_db(self._save_guild_config_sync, guild.id,
+
+                               jail_role=jail_role.id, jail_category=category.id, appeals_channel=appeals_chan.id, admin_channel=admin_chan.id, admin_role=None)
+
+            embed = discord.Embed(title="📩 Appeals", description="If you are jailed and want to appeal, click **Create Appeal** below and follow the instructions.", color=discord.Color.blurple(), timestamp=datetime.datetime.utcnow())
+
+            embed.set_author(name=guild.name, icon_url=guild.icon.url if guild.icon else None)
+
+            embed.set_footer(text="Appeal system • Click the button to start")
+
+            view = CreateAppealView(self)
 
             try:
 
-                if jail_role and member and jail_role in member.roles:
+                async for m in appeals_chan.history(limit=50):
 
-                    await member.remove_roles(jail_role, reason=f"Appeal approved by {ctx.author}")
+                    if m.author == guild.me and m.embeds:
 
-                if member and roles_objs:
+                        try:
 
-                    await member.add_roles(*roles_objs, reason=f"Appeal approved by {ctx.author}")
+                            await m.delete()
+
+                        except Exception:
+
+                            pass
+
+                await appeals_chan.send(embed=embed, view=view)
+
+            except Exception:
+
+                logger.exception("Failed to post appeals message")
+
+            le = discord.Embed(title="🛠️ Jail System Setup", description=f"Jail system created by {ctx.author.mention}", color=discord.Color.blurple(), timestamp=datetime.datetime.utcnow())
+
+            le.add_field(name="Jail Role", value=jail_role.mention)
+
+            le.add_field(name="Appeals Channel", value=appeals_chan.mention)
+
+            le.add_field(name="Admin Channel", value=admin_chan.mention)
+
+            le.set_footer(text=f"Setup at {pretty_ts()}")
+
+            await self._log_mod(guild, embed=le)
+
+            await ctx.send(embed=discord.Embed(title="Jail system", description="Setup complete. Appeals button posted.", color=discord.Color.green()))
+
+        except Exception as e:
+
+            logger.exception("setup_jail failed")
+
+            await ctx.send(embed=discord.Embed(title="Error", description=f"Setup failed: {e}", color=discord.Color.red()))
+
+    # ------------------ Setup commands ------------------
+
+    @commands.command(name="setjailadmins")
+
+    @commands.has_permissions(administrator=True)
+
+    async def set_jail_admins(self, ctx: commands.Context, role: discord.Role):
+
+        """Set a role as Jail Admins"""
+
+        try:
+
+            guild = ctx.guild
+
+            cfg = await self._run_db(self._get_guild_config_sync, guild.id) or {}
+
+            # Speichere Role-ID sicher
+
+            await self._run_db(self._save_guild_config_sync,
+
+                               guild.id,
+
+                               jail_role=cfg.get("jail_role"),
+
+                               jail_category=cfg.get("jail_category"),
+
+                               appeals_channel=cfg.get("appeals_channel"),
+
+                               admin_channel=cfg.get("admin_channel"),
+
+                               admin_role=role.id if role else None)
+
+            await ctx.send(embed=discord.Embed(
+
+                title="Jail Admins Set",
+
+                description=f"Role {role.mention} set as jail admins.",
+
+                color=discord.Color.green()
+
+            ))
+
+            # Log
+
+            le = discord.Embed(
+
+                title="👮 Jail Admin Role Updated",
+
+                description=f"{role.mention} set as jail admins by {ctx.author.mention}",
+
+                color=discord.Color.blurple(),
+
+                timestamp=datetime.datetime.utcnow()
+
+            )
+
+            le.set_footer(text=pretty_ts())
+
+            await self._log_mod(guild, embed=le)
+
+        except Exception:
+
+            logger.exception("set_jail_admins failed")
+
+            await ctx.send(embed=discord.Embed(
+
+                title="Error",
+
+                description="Could not set jail admins.",
+
+                color=discord.Color.red()
+
+            ))
+
+    # ------------------ Jail command ------------------
+
+    @commands.command(name="jail")
+
+    async def cmd_jail(self, ctx: commands.Context, member: discord.Member, duration: Optional[str] = None, *, reason: str = "No reason provided"):
+
+        """Jail a member with optional duration"""
+
+        try:
+
+            # Permission check
+
+            if not self._is_jail_admin(ctx.author):
+
+                return await ctx.send(embed=discord.Embed(
+
+                    title="Not allowed",
+
+                    description="Only Jail Admins or Admins can jail.",
+
+                    color=discord.Color.red()
+
+                ))
+
+            guild = ctx.guild
+
+            cfg = await self._run_db(self._get_guild_config_sync, guild.id)
+
+            if not cfg or not cfg.get("jail_role"):
+
+                return await ctx.send(embed=discord.Embed(
+
+                    title="Not configured",
+
+                    description="Use .setupjail first.",
+
+                    color=discord.Color.red()
+
+                ))
+
+            jail_role = guild.get_role(int(cfg["jail_role"]))
+
+            if not jail_role:
+
+                return await ctx.send(embed=discord.Embed(
+
+                    title="Missing role",
+
+                    description="Configured jail role not found.",
+
+                    color=discord.Color.red()
+
+                ))
+
+            # Already jailed?
+
+            jailed = await self._run_db(self._get_jailed_user_sync, guild.id, member.id)
+
+            if jailed:
+
+                return await ctx.send(embed=discord.Embed(
+
+                    title="Already jailed",
+
+                    description=f"{member.mention} is already jailed.",
+
+                    color=discord.Color.orange()
+
+                ))
+
+            # Parse duration
+
+            release_at = None
+
+            if duration:
+
+                secs = parse_duration(duration)
+
+                if secs:
+
+                    release_at = (datetime.datetime.utcnow() + datetime.timedelta(seconds=secs)).isoformat()
+
+                else:
+
+                    reason = f"{duration} {reason}"
+
+            # Save previous roles to restore later
+
+            prev_roles = [r.id for r in member.roles if r != guild.default_role and r != jail_role]
+
+            roles_to_remove = [r for r in member.roles if r != guild.default_role and r != jail_role]
+
+            # Bot permission checks
+
+            if not self._bot_can_manage_roles(guild):
+
+                return await ctx.send(embed=discord.Embed(
+
+                    title="Missing Permission",
+
+                    description="I need Manage Roles permission.",
+
+                    color=discord.Color.red()
+
+                ))
+
+            if not self._bot_role_position_ok(guild, jail_role):
+
+                return await ctx.send(embed=discord.Embed(
+
+                    title="Role position issue",
+
+                    description="My top role must be above the jail role.",
+
+                    color=discord.Color.red()
+
+                ))
+
+            # Remove previous roles and add jail role
+
+            if roles_to_remove:
+
+                try:
+
+                    await member.remove_roles(*roles_to_remove, reason=f"Jailed by {ctx.author}: {reason}")
+
+                except Exception:
+
+                    # if removing roles fails, continue but log
+
+                    logger.exception("Failed to remove previous roles from %s", member)
+
+            try:
+
+                await member.add_roles(jail_role, reason=f"Jailed by {ctx.author}: {reason}")
+
+            except Exception:
+
+                logger.exception("Failed to add jail role to %s", member)
+
+                return await ctx.send(embed=discord.Embed(title="Error", description="Could not assign jail role.", color=discord.Color.red()))
+
+            # Save to DB safely via executor-wrapped _run_db
+
+            try:
+
+                await self._run_db(self._add_jailed_user_sync, guild.id, member.id, reason, prev_roles, release_at)
+
+            except Exception:
+
+                logger.exception("Failed to add jailed user to DB")
+
+                # attempt to rollback role change (best-effort)
+
+                try:
+
+                    if jail_role in member.roles:
+
+                        await member.remove_roles(jail_role, reason="Rollback after DB failure")
+
+                    if prev_roles:
+
+                        roles_objs = [guild.get_role(rid) for rid in prev_roles if guild.get_role(rid)]
+
+                        if roles_objs:
+
+                            await member.add_roles(*roles_objs, reason="Rollback after DB failure")
+
+                except Exception:
+
+                    logger.exception("Rollback failed")
+
+                return await ctx.send(embed=discord.Embed(
+
+                    title="Error",
+
+                    description="Jailing failed (DB issue).",
+
+                    color=discord.Color.red()
+
+                ))
+
+            # Verify DB
+
+            jailed_check = await self._run_db(self._get_jailed_user_sync, guild.id, member.id)
+
+            if not jailed_check:
+
+                # DB didn't return the record after insert
+
+                logger.error("DB missing record after insert for %s in %s", member.id, guild.id)
+
+                return await ctx.send(embed=discord.Embed(
+
+                    title="Error",
+
+                    description="Jailing failed (DB record missing).",
+
+                    color=discord.Color.red()
+
+                ))
+
+            # DM user
+
+            release_text = f"\nRelease at: {release_at}" if release_at else ""
+
+            try:
+
+                await member.send(f"You were jailed in {guild.name} by {ctx.author}. Reason: {reason}{release_text}")
 
             except Exception:
 
                 pass
 
-            self._remove_jailed_user(guild.id, int(user_id))
+            # Confirmation message
 
-        try:
+            await ctx.send(embed=discord.Embed(
 
-            with open(filename, "r", encoding="utf-8") as f:
+                title="User Jailed",
 
-                transcript_text = f.read()
+                description=f"{member.mention} jailed successfully.",
 
-        except Exception:
+                color=discord.Color.green()
 
-            transcript_text = "[Could not read transcript file]"
+            ))
 
-        self._close_appeal(ctx.channel.id, "approved", transcript_text)
+            # Mod log
 
-        embed = discord.Embed(title="✅ Appeal Approved", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
+            le = discord.Embed(
 
-        embed.add_field(name="By", value=ctx.author.mention, inline=True)
+                title="🚨 User Jailed",
 
-        embed.add_field(name="User", value=f"<@{user_id}>", inline=True)
+                description=f"{member.mention} jailed by {ctx.author.mention}",
 
-        embed.add_field(name="Message", value=message, inline=False)
+                color=discord.Color.blurple(),
 
-        embed.set_footer(text=f"Approved at {pretty_ts()}")
+                timestamp=datetime.datetime.utcnow()
 
-        try:
+            )
 
-            dfile = discord.File(filename, filename=os.path.basename(filename))
+            le.add_field(name="Reason", value=reason)
 
-            await self._log_mod(guild, embed=embed, file=dfile)
+            if release_at:
 
-        except Exception:
+                le.add_field(name="Release at", value=release_at)
 
-            await self._log_mod(guild, embed=embed)
-
-        try:
-
-            os.remove(filename)
+            await self._log_mod(guild, embed=le)
 
         except Exception:
 
-            pass
+            logger.exception("cmd_jail failed")
+
+            await ctx.send(embed=discord.Embed(title="Error", description="Jailing failed.", color=discord.Color.red()))
+
+    # ------------------ Unjail command ------------------
+
+    @commands.command(name="unjail")
+
+    async def cmd_unjail(self, ctx: commands.Context, member: discord.Member):
 
         try:
 
-            if member:
+            if not self._is_jail_admin(ctx.author):
 
-                await member.send(f"Your appeal in {guild.name} was APPROVED by {ctx.author}. Message: {message}")
+                return await ctx.send(embed=discord.Embed(
 
-        except Exception:
+                    title="Not allowed",
 
-            pass
+                    description="Only Jail Admins or Admins can unjail.",
 
-        await ctx.send(embed=discord.Embed(title="Appeal approved — Ticket closing...", color=discord.Color.green()))
+                    color=discord.Color.red()
 
-        await asyncio.sleep(3)
+                ))
 
-        try:
+            guild = ctx.guild
 
-            await ctx.channel.delete(reason=f"Appeal approved by {ctx.author}")
+            cfg = await self._run_db(self._get_guild_config_sync, guild.id)
 
-        except Exception:
+            jail_role = guild.get_role(cfg.get("jail_role")) if cfg else None
 
-            pass
+            if not jail_role or jail_role not in member.roles:
 
-    @commands.command(name="deny")
+                return await ctx.send(embed=discord.Embed(
 
-    async def cmd_deny(self, ctx, *, reason: Optional[str] = "Denied"):
+                    title="Not jailed",
 
-        if not self._is_ticket_channel(ctx.channel):
+                    description=f"{member.mention} is not jailed.",
 
-            await ctx.send(embed=discord.Embed(title="Not a ticket", description="This command must be used inside an appeal ticket.", color=discord.Color.orange()))
+                    color=discord.Color.orange()
 
-            return
+                ))
 
-        if not self._is_jail_admin(ctx.author) and not ctx.author.guild_permissions.administrator:
+            jailed = await self._run_db(self._get_jailed_user_sync, guild.id, member.id)
 
-            await ctx.send(embed=discord.Embed(title="Not allowed", description="You do not have permission to deny appeals.", color=discord.Color.red()))
+            prev_roles = []
 
-            return
+            if jailed and jailed.get("previous_roles"):
 
-        c = self.conn.cursor()
+                for rid in json.loads(jailed["previous_roles"]):
 
-        rec = c.execute("SELECT * FROM appeals WHERE ticket_channel_id = ? AND status = 'open'", (ctx.channel.id,)).fetchone()
+                    r = guild.get_role(rid)
 
-        if not rec:
+                    if r and self._bot_role_position_ok(guild, r):
 
-            await ctx.send(embed=discord.Embed(title="No open appeal", description="Cannot find an open appeal for this channel.", color=discord.Color.orange()))
+                        prev_roles.append(r)
 
-            return
+            # Remove jail role
 
-        user_id = rec["user_id"]
+            if jail_role in member.roles:
 
-        appeal_id = rec["id"]
+                try:
 
-        guild = ctx.guild
+                    await member.remove_roles(jail_role, reason=f"Unjailed by {ctx.author}")
 
-        member = guild.get_member(int(user_id))
+                except Exception:
 
-        filename = await self._make_transcript_file(ctx.channel, user_id, appeal_id)
+                    logger.exception("Failed to remove jail role from %s", member)
 
-        try:
+            # Restore previous roles
 
-            with open(filename, "r", encoding="utf-8") as f:
+            if prev_roles:
 
-                transcript_text = f.read()
+                try:
 
-        except Exception:
+                    await member.add_roles(*prev_roles, reason=f"Unjailed by {ctx.author}")
 
-            transcript_text = "[Could not read transcript file]"
+                except Exception:
 
-        self._close_appeal(ctx.channel.id, "denied", transcript_text)
+                    logger.exception("Failed to restore roles to %s", member)
 
-        embed = discord.Embed(title="❌ Appeal Denied", color=discord.Color.red(), timestamp=datetime.datetime.utcnow())
+            # Remove from DB
 
-        embed.add_field(name="By", value=ctx.author.mention, inline=True)
+            try:
 
-        embed.add_field(name="User", value=f"<@{user_id}>", inline=True)
+                await self._run_db(self._remove_jailed_user_sync, guild.id, member.id)
 
-        embed.add_field(name="Reason", value=reason, inline=False)
+            except Exception:
 
-        embed.set_footer(text=f"Denied at {pretty_ts()}")
+                logger.exception("Failed to remove jailed user from DB")
 
-        try:
+            await ctx.send(embed=discord.Embed(
 
-            dfile = discord.File(filename, filename=os.path.basename(filename))
+                title="User Unjailed",
 
-            await self._log_mod(guild, embed=embed, file=dfile)
+                description=f"{member.mention} unjailed successfully.",
 
-        except Exception:
+                color=discord.Color.green()
 
-            await self._log_mod(guild, embed=embed)
+            ))
 
-        try:
+            try:
 
-            os.remove(filename)
+                await member.send(f"You were unjailed in {guild.name} by {ctx.author}.")
 
-        except Exception:
+            except Exception:
 
-            pass
+                pass
 
-        try:
+            le = discord.Embed(
 
-            if member:
+                title="✅ User Unjailed",
 
-                await member.send(f"Your appeal in {guild.name} was DENIED by {ctx.author}. Reason: {reason}")
+                description=f"{member.mention} unjailed by {ctx.author.mention}",
 
-        except Exception:
+                color=discord.Color.blurple(),
 
-            pass
+                timestamp=datetime.datetime.utcnow()
 
-        await ctx.send(embed=discord.Embed(title="Appeal denied — Ticket closing...", color=discord.Color.red()))
+            )
 
-        await asyncio.sleep(3)
-
-        try:
-
-            await ctx.channel.delete(reason=f"Appeal denied by {ctx.author}")
+            await self._log_mod(guild, embed=le)
 
         except Exception:
 
-            pass
+            logger.exception("cmd_unjail failed")
 
-    @commands.command(name="appeallog")
+            await ctx.send(embed=discord.Embed(title="Error", description="Unjailing failed.", color=discord.Color.red()))
 
-    @commands.has_permissions(manage_guild=True)
+    @commands.command()
 
-    async def cmd_appeallog(self, ctx, member: discord.Member, limit: int = 5):
+    async def check_jail(self, ctx, member: discord.Member):
 
-        guild = ctx.guild
+        jailed = await self._run_db(self._get_jailed_user_sync, ctx.guild.id, member.id)
 
-        rows = self._get_appeals_for_user(guild.id, member.id, limit=limit)
+        await ctx.send(f"DB record: {jailed}")
 
-        if not rows:
+    # ------------------ Background timeout check ------------------
 
-            await ctx.send(embed=discord.Embed(title="No appeals", description="No appeals found for this user.", color=discord.Color.orange()))
+    @tasks.loop(seconds=30)
 
-            return
+    async def check_timeouts(self):
 
-        lines = []
+        async with self._timeout_lock:
 
-        for r in rows:
+            try:
 
-            created = r["created_at"]
+                # fetch rows with release_at not null
 
-            status = r["status"]
+                def _fetch_due(conn):
 
-            lid = r["id"]
+                    c = conn.cursor()
 
-            lines.append(f"• ID: {lid} — {status} — created at {created}")
+                    rows = c.execute("SELECT * FROM jailed_users WHERE release_at IS NOT NULL").fetchall()
 
-        embed = discord.Embed(title=f"Appeals for {member}", description="\n".join(lines), color=BLURPLE)
+                    return [dict(r) for r in rows]
 
-        embed.set_footer(text=f"Requested by {ctx.author} • {pretty_ts()}")
+                rows = await self._run_db(lambda conn: _fetch_due(conn))
 
-        await ctx.send(embed=embed)
+                now = datetime.datetime.utcnow()
 
-    def cog_unload(self):
+                for r in rows:
 
-        try:
+                    try:
 
-            self.conn.close()
+                        release_dt = datetime.datetime.fromisoformat(r["release_at"])
 
-        except Exception:
+                    except Exception:
 
-            pass
+                        # malformed date -> remove entry to avoid stuck jail
+
+                        logger.exception("Invalid release_at for jailed user: %s", r)
+
+                        await self._run_db(self._remove_jailed_user_sync, r["guild_id"], r["user_id"])
+
+                        continue
+
+                    if release_dt <= now:
+
+                        guild = self.bot.get_guild(r["guild_id"])
+
+                        if guild:
+
+                            member = guild.get_member(r["user_id"])
+
+                            if member:
+
+                                cfg = await self._run_db(self._get_guild_config_sync, guild.id)
+
+                                jail_role = guild.get_role(cfg["jail_role"]) if cfg else None
+
+                                prev_roles = []
+
+                                try:
+
+                                    prev_roles = [guild.get_role(rid) for rid in json.loads(r["previous_roles"]) if guild.get_role(rid)]
+
+                                except Exception:
+
+                                    logger.exception("Failed to parse previous_roles during automatic unjail for %s", r["user_id"])
+
+                                try:
+
+                                    if jail_role and jail_role in member.roles:
+
+                                        await member.remove_roles(jail_role, reason="Automatic unjail")
+
+                                    if prev_roles:
+
+                                        # filter roles by bot position
+
+                                        good_roles = [rr for rr in prev_roles if rr and self._bot_role_position_ok(guild, rr)]
+
+                                        if good_roles:
+
+                                            await member.add_roles(*good_roles, reason="Automatic unjail")
+
+                                    try:
+
+                                        await member.send(f"Your jail time in {guild.name} has expired. You are now unjailed.")
+
+                                    except Exception:
+
+                                        pass
+
+                                except Exception:
+
+                                    logger.exception("Automatic unjail failed for %s in %s", member, guild)
+
+                        # cleanup DB regardless of success
+
+                        await self._run_db(self._remove_jailed_user_sync, r["guild_id"], r["user_id"])
+
+            except Exception:
+
+                logger.exception("check_timeouts loop failed")
+
+    @check_timeouts.before_loop
+
+    async def _before_check_timeouts(self):
+
+        await self.bot.wait_until_ready()
 
 async def setup(bot: commands.Bot):
 

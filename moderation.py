@@ -30,7 +30,7 @@ UNIT_MULTIPLIERS = {
 
 MAX_MUTE_DAYS = 28  # Discord maximum timeout
 
-DB_FILE = "moderation_database.db"
+
 
 DB_FILE = "moderation_database.db"
 
@@ -100,6 +100,31 @@ class Database:
                 PRIMARY KEY (user_id, guild_id)
             )
         ''')
+
+        # Banned users table
+        await c.execute('''
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id TEXT,
+                guild_id TEXT,
+                moderator_id TEXT,
+                reason TEXT,
+                timestamp TEXT,
+                PRIMARY KEY (user_id, guild_id)
+            )
+        ''')
+
+        # Kicked users table
+        await c.execute('''
+            CREATE TABLE IF NOT EXISTS kicked_users (
+                user_id TEXT,
+                guild_id TEXT,
+                moderator_id TEXT,
+                reason TEXT,
+                timestamp TEXT,
+                PRIMARY KEY (user_id, guild_id)
+            )
+        ''')
+
         
         await conn.commit()
         await conn.close()
@@ -134,6 +159,7 @@ class ModerationCog(commands.Cog):
         await self.db._setup_db()
 
     # ----------------- database helpers -----------------
+    
     async def execute_db(self, query: str, params: tuple = ()):
         """Execute a database query asynchronously"""
         conn = await self.db.get_connection()
@@ -170,6 +196,7 @@ class ModerationCog(commands.Cog):
             await conn.close()
 
     # ----------------- guild config helpers -----------------
+
     async def get_guild_setting(self, guild_id: int, setting: str):
         result = await self.fetchone_db(
             "SELECT * FROM guild_settings WHERE guild_id = ?", 
@@ -221,6 +248,7 @@ class ModerationCog(commands.Cog):
             )
 
     # ----------------- staff check -----------------
+
     async def is_staff(self, member: discord.Member):
         """Basic in-code check for staff: configured staff role OR Manage Messages / Kick Members."""
         # Get the staff role asynchronously
@@ -348,6 +376,7 @@ class ModerationCog(commands.Cog):
         await ctx.send(embed=embed)
 
     # ---------------- SAFELIST COMMANDS ----------------
+
     @commands.group(name="safelist", invoke_without_command=True)
     @commands.has_permissions(administrator=True)
     async def safelist_group(self, ctx):
@@ -359,7 +388,7 @@ class ModerationCog(commands.Cog):
             "`!safelist remove <@user/@role or id>`\n"
             "`!safelist list`"
         ))
-
+#   -------------------- safelist add ---------------------
     @safelist_group.command(name="add")
     @commands.has_permissions(administrator=True)
     async def safelist_add(self, ctx, *, target: str):
@@ -412,6 +441,7 @@ class ModerationCog(commands.Cog):
             await self.log(ctx.guild, create_mod_embed("Safelist", f"{ctx.author} added {added} to safelist."))
         else:
             await ctx.send(embed=create_error("❌ Could not add target to safelist.\nMake sure you mention a valid user or role."))
+# -----------------------------------------safelist remove ----------------------------------------
 
     @safelist_group.command(name="remove")
     @commands.has_permissions(administrator=True)
@@ -471,6 +501,7 @@ class ModerationCog(commands.Cog):
         await ctx.send(embed=embed)
 
     # ----------------- warnings -----------------
+
     @commands.command(name="warn")
     @staff_only()
     async def warn(self, ctx, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
@@ -488,6 +519,8 @@ class ModerationCog(commands.Cog):
         
         await ctx.send(embed=create_success("User Warned", f"{member.mention} was warned.\nID: `{wid}`\nReason: {reason}"))
         await self.log(ctx.guild, create_mod_embed("Warn", f"{ctx.author} warned {member} (ID: {wid}). Reason: {reason}"))
+
+#   --------------------------------------- warning list ----------------------------------------
 
     @commands.command(name="warnlist")
     @staff_only()
@@ -508,6 +541,8 @@ class ModerationCog(commands.Cog):
             lines.append(f"• ID: `{w[0]}` — {w[2]} (by {modname} at {w[3]})")
         
         await ctx.send(embed=create_mod_embed(f"Warnings for {member}", "\n".join(lines)))
+
+#   --------------------------------------Remove Warning ---------------------------------------
 
     @commands.command(name="removewarn")
     @staff_only()
@@ -530,6 +565,8 @@ class ModerationCog(commands.Cog):
         
         await ctx.send(embed=create_success("Warning Removed", f"Removed warn `{warn_id}` from {member.mention}"))
         await self.log(ctx.guild, create_mod_embed("Warn Removed", f"{ctx.author} removed warn `{warn_id}` from {member}."))
+       
+#   --------------------------------------Clear Warning ---------------------------------------
 
     @commands.command(name="clearwarns")
     @staff_only()
@@ -567,8 +604,50 @@ class ModerationCog(commands.Cog):
         
         await ctx.send(embed=create_success("Note Added", f"Note added to {member.mention} (ID: `{nid}`)."))
         await self.log(ctx.guild, create_mod_embed("Note", f"{ctx.author} added note to {member}: {note_text}"))
+    
+    # ----------------- note list -----------------
+    @commands.command(name="notelist")
+    @staff_only()
+    async def notelist(self, ctx, member: discord.Member):
+        notes = await self.fetchall_db(
+            "SELECT id, author_id, note, timestamp FROM notes WHERE guild_id = ? AND user_id = ?",
+            (str(ctx.guild.id), str(member.id))
+        )
+        
+        if not notes:
+            await ctx.send(embed=create_mod_embed("Notes", f"{member.mention} has no notes."))
+            return
+        
+        lines = []
+        for n in notes:
+            author = ctx.guild.get_member(int(n[1]))
+            author_name = author.display_name if author else n[1]
+            lines.append(f"• ID: `{n[0]}` — {n[2]} (by {author_name} at {n[3]})")
+        
+        await ctx.send(embed=create_mod_embed(f"Notes for {member}", "\n".join(lines)))
+    
+    # ----------------- Remove note -----------------
+    @commands.command(name="removenote")
+    @staff_only()
+    async def removenote(self, ctx, member: discord.Member, note_id: str):
+        # Check if the note exists first
+        existing_note = await self.fetchone_db(
+            "SELECT id FROM notes WHERE guild_id = ? AND user_id = ? AND id = ?",
+            (str(ctx.guild.id), str(member.id), note_id)
+        )
+        if not existing_note:
+            await ctx.send(embed=create_error("Note ID not found for that user."))
+            return
+        # Delete the note
+        await self.execute_db("DELETE from notes WHERE guild_id = ? AND id = ?",
+            (str(ctx.guild.id), str(member.id), note_id)
+        )
+        await ctx.send(embed=create_success("Note Removed", f"Removed note `{note_id}` from {member.mention}"))
+        await self.log(ctx.guild, create_mod_embed("Note Removed", f"{ctx.author} removed note `{note_id}` from {member}."))
+
 
     # ----------------- mute/unmute using Discord timeout -----------------
+
     @commands.command(name="mute")
     @staff_only()
     async def mute(self, ctx, member: discord.Member, duration: Optional[str] = None, *, reason: Optional[str] = "No reason provided"):
@@ -616,6 +695,8 @@ class ModerationCog(commands.Cog):
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not mute user: {e}"))
 
+#   -------------------------------- unmute -----------------------------
+
     @commands.command(name="unmute")
     @staff_only()
     async def unmute(self, ctx, member: discord.Member):
@@ -627,6 +708,7 @@ class ModerationCog(commands.Cog):
             await ctx.send(embed=create_error(f"Could not unmute user: {e}"))
 
     # ----------------- ban/unban/kick -----------------
+
     @commands.command(name="ban")
     @commands.has_permissions(ban_members=True)
     async def ban(self, ctx, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
@@ -637,8 +719,16 @@ class ModerationCog(commands.Cog):
             await member.ban(reason=f"{reason} (by {ctx.author})")
             await ctx.send(embed=create_success("Banned", f"{member} has been banned."))
             await self.log(ctx.guild, create_mod_embed("Ban", f"{ctx.author} banned {member}. Reason: {reason}"))
+            # Record ban in database
+            timestamp = datetime.datetime.utcnow().isoformat()
+            await self.execute_db(
+                "INSERT INTO banned_users (user_id, guild_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (str(member.id), str(ctx.guild.id), str(ctx.author.id), reason, timestamp)
+            )
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not ban member: {e}"))
+
+# -------------------unban ------------------------------------------------
 
     @commands.command(name="unban")
     @commands.has_permissions(ban_members=True)
@@ -660,6 +750,8 @@ class ModerationCog(commands.Cog):
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not unban user: {e}"))
 
+# ------------------------------------------- kick --------------------------------
+
     @commands.command(name="kick")
     @commands.has_permissions(kick_members=True)
     async def kick(self, ctx, member: discord.Member, *, reason: Optional[str] = "No reason provided"):
@@ -670,11 +762,17 @@ class ModerationCog(commands.Cog):
             await member.kick(reason=f"{reason} (by {ctx.author})")
             await ctx.send(embed=create_success("Kicked", f"{member} has been kicked."))
             await self.log(ctx.guild, create_mod_embed("Kick", f"{ctx.author} kicked {member}. Reason: {reason}"))
+            # Record kick in database
+            timestamp = datetime.datetime.utcnow().isoformat()
+            await self.execute_db(
+                "INSERT INTO kicked_users (user_id, guild_id, moderator_id, reason, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (str(member.id), str(ctx.guild.id), str(ctx.author.id), reason, timestamp)
+            )
         except Exception as e:
             await ctx.send(embed=create_error(f"Could not kick member: {e}"))
 
+# ------------------------------------ whois ---------------------------------------
 
-    # ----------------- whois -----------------
     @commands.command(name="whois")
     @staff_only()
     async def whois(self, ctx, member: discord.Member):
@@ -694,13 +792,60 @@ class ModerationCog(commands.Cog):
             (str(member.id), str(ctx.guild.id))
         )
         
+        # Get ban record with details
+        banned_record = await self.fetchone_db(
+            "SELECT moderator_id, reason, timestamp FROM banned_users WHERE user_id = ? AND guild_id = ?",
+            (str(member.id), str(ctx.guild.id))
+        )
+        
+        # Get kick record with details
+        kicked_record = await self.fetchone_db(
+            "SELECT moderator_id, reason, timestamp FROM kicked_users WHERE user_id = ? AND guild_id = ?",
+            (str(member.id), str(ctx.guild.id))
+        )
+        
+        # Check if user is currently banned from the guild
+        try:
+            ban_entry = await ctx.guild.fetch_ban(member)
+            currently_banned = True
+            ban_reason = ban_entry.reason or "No reason provided"
+        except discord.NotFound:
+            currently_banned = False
+            ban_reason = None
+        
         embed = create_mod_embed("Whois", f"Information for {member.mention}")
         embed.add_field(name="Name", value=f"{member} ({member.id})", inline=False)
-        embed.add_field(name="Joined At", value=member.joined_at.isoformat() if member.joined_at else "Unknown", inline=True)
+        embed.add_field(name="Joined At", value=member.joined_at.strftime("%Y-%m-%d %H:%M:%S") if member.joined_at else "Unknown", inline=True)
+        embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d %H:%M:%S"), inline=True)
         embed.add_field(name="Roles", value=", ".join([r.name for r in member.roles if r != ctx.guild.default_role]) or "(none)", inline=False)
+        
+        # Moderation history section
+        embed.add_field(name="🔒 Moderation History", value="\u200b", inline=False)
         embed.add_field(name="Jailed", value="Yes" if jailed else "No", inline=True)
+        embed.add_field(name="Currently Banned", value="Yes" if currently_banned else "No", inline=True)
+        embed.add_field(name="Ban Records", value="1" if banned_record else "0", inline=True)
+        embed.add_field(name="Kick Records", value="1" if kicked_record else "0", inline=True)
         embed.add_field(name="Notes", value=str(notes_count[0]) if notes_count else "0", inline=True)
         embed.add_field(name="Warnings", value=str(warns_count[0]) if warns_count else "0", inline=True)
+        
+        # Add detailed ban information if available
+        if banned_record:
+            mod_id = banned_record[0]
+            reason = banned_record[1] or "No reason provided"
+            timestamp = banned_record[2]
+            embed.add_field(name="Last Ban", value=f"By: <@{mod_id}>\nWhen: {timestamp}\nReason: {reason}", inline=False)
+        
+        # Add detailed kick information if available
+        if kicked_record:
+            mod_id = kicked_record[0]
+            reason = kicked_record[1] or "No reason provided"
+            timestamp = kicked_record[2]
+            embed.add_field(name="Last Kick", value=f"By: <@{mod_id}>\nWhen: {timestamp}\nReason: {reason}", inline=False)
+        
+        # Add current ban reason if applicable
+        if currently_banned and ban_reason:
+            embed.add_field(name="Current Ban Reason", value=ban_reason, inline=False)
+        
         await ctx.send(embed=embed)
 
 # ----------------- setup -----------------
