@@ -308,6 +308,7 @@ class ModerationCog(commands.Cog):
         return commands.check(predicate)
 
     # ----------------- commands: setup -----------------
+
     @commands.command(name="setstaffrole")
     @commands.has_permissions(administrator=True)
     async def set_staff_role(self, ctx, role: discord.Role):
@@ -629,7 +630,7 @@ class ModerationCog(commands.Cog):
     # ----------------- Remove note -----------------
     @commands.command(name="removenote")
     @staff_only()
-    async def removenote(self, ctx, member: discord.Member, note_id: str):
+    async def removenote(self, ctx, member: discord.Member, note_id: str):  # command syntax will be .removenote @user note_id 
         # Check if the note exists first
         existing_note = await self.fetchone_db(
             "SELECT id FROM notes WHERE guild_id = ? AND user_id = ? AND id = ?",
@@ -639,7 +640,7 @@ class ModerationCog(commands.Cog):
             await ctx.send(embed=create_error("Note ID not found for that user."))
             return
         # Delete the note
-        await self.execute_db("DELETE from notes WHERE guild_id = ? AND id = ?",
+        await self.execute_db("DELETE from notes WHERE guild_id = ? AND user_id = ? AND id = ?",
             (str(ctx.guild.id), str(member.id), note_id)
         )
         await ctx.send(embed=create_success("Note Removed", f"Removed note `{note_id}` from {member.mention}"))
