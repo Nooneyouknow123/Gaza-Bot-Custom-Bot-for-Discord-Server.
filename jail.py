@@ -1,16 +1,22 @@
-# jail_cog.py
+# jail_cog_combined.py
 
 """
 
-Stabile Jail Cog - überarbeitete Version
+Stabile Jail Cog - vollständige Version mit integriertem Appeal-System
 
-- Single source of DB locking via async _run_db (uses run_in_executor)
+Enthält:
 
-- Keine Doppel-Locks mehr
+- DB helpers (sqlite)
 
-- Verbesserte Fehlerbehandlung & Logging
+- Jail/Unjail commands
 
-- Funktional identisch zum Original, Appeals/Tickets unverändert
+- Timeout checker for automatic unjail
+
+- Appeals/ticket system (create appeal button, approve/deny/close handlers)
+
+- Views for CreateAppeal and Ticket actions
+
+Bitte prüfe die Konfiguration (DB_FILE path, permissions) bevor du den Cog produktiv einsetzt.
 
 """
 
@@ -1188,7 +1194,7 @@ class JailCog(commands.Cog):
 
                     try:
 
-                        release_dt = datetime.datetime.fromisoformat(r["release_at"])
+                        release_dt = datetime.datetime.fromisoformat(r["release_at"]) 
 
                     except Exception:
 
@@ -1266,7 +1272,720 @@ class JailCog(commands.Cog):
 
         await self.bot.wait_until_ready()
 
+    # ------------------ Appeal System ------------------
+
+    @commands.Cog.listener()
+
+    async def on_interaction(self, interaction: discord.Interaction):
+
+        """Handle all appeal + ticket button interactions"""
+
+        if not interaction.type == discord.InteractionType.component:
+
+            return
+
+        cid = interaction.data.get("custom_id")
+
+        # --- CREATE APPEAL BUTTON ---
+
+        if cid == "create_appeal":
+
+            await self.handle_create_appeal(interaction)
+
+            return
+
+        # --- APPROVE BUTTON ---
+
+        if cid == "ticket_approve":
+
+            await self.handle_ticket_approve(interaction)
+
+            return
+
+        # --- DENY BUTTON ---
+
+        if cid == "ticket_deny":
+
+            await self.handle_ticket_deny(interaction)
+
+            return
+
+        # --- CLOSE TICKET BUTTON ---
+
+        if cid == "ticket_close":
+
+            await self.handle_ticket_close(interaction)
+
+            return
+
+    # ------------------ CREATE APPEAL ------------------
+
+    async def handle_create_appeal(self, interaction: discord.Interaction):
+
+        guild = interaction.guild
+
+        user = interaction.user
+
+        cfg = await self._run_db(self._get_guild_config_sync, guild.id)
+
+        if not cfg:
+
+            return await interaction.response.send_message("❌ Jail system not configured.", ephemeral=True)
+
+        
+
+        # check if user is jailed
+
+        jailed = await self._run_db(self._get_jailed_user_sync, guild.id, user.id)
+
+        if not jailed:
+
+            return await interaction.response.send_message(
+
+                "❌ You are not jailed.", ephemeral=True
+
+            )
+
+        
+
+        # Check last appeals
+
+        appeals = await self._run_db(self._get_appeals_for_user_sync, guild.id, user.id)
+
+        if appeals:
+
+            last = datetime.datetime.fromisoformat(appeals[0]["created_at"])
+
+            diff = datetime.datetime.utcnow() - last
+
+            if diff.total_seconds() < 86400:
+
+                return await interaction.response.send_message(
+
+                    "⏳ You can only create **one appeal every 24 hours**.",
+
+                    ephemeral=True,
+
+                )
+
+        
+
+        # Create ticket channel
+
+        category = guild.get_channel(cfg.get("jail_category"))
+
+        name = f"appeal-{user.name}".replace(" ", "-").lower()[:32]  # Limit to 32 chars
+
+        
+
+        # FIXED PERMISSIONS: Jail admins can see chat history and jailed user can see everything
+
+        overwrites = {
+
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+
+            user: discord.PermissionOverwrite(
+
+                read_messages=True, 
+
+                send_messages=True,
+
+                read_message_history=True,  # FIX: Jailed can see chat history
+
+                attach_files=True,
+
+                embed_links=True
+
+            ),
+
+            guild.me: discord.PermissionOverwrite(
+
+                read_messages=True, 
+
+                send_messages=True,
+
+                manage_messages=True,
+
+                read_message_history=True
+
+            ),
+
+        }
+
+        
+
+        # Add jail admin role permissions
+
+        admin_role = guild.get_role(cfg.get("admin_role")) if cfg.get("admin_role") else None
+
+        if admin_role:
+
+            overwrites[admin_role] = discord.PermissionOverwrite(
+
+                read_messages=True, 
+
+                send_messages=True,
+
+                manage_messages=True,
+
+                read_message_history=True  # FIX: Admins can see chat history
+
+            )
+
+        
+
+        # Also add server administrators
+
+        for role in guild.roles:
+
+            if role.permissions.administrator:
+
+                overwrites[role] = discord.PermissionOverwrite(
+
+                    read_messages=True, 
+
+                    send_messages=True,
+
+                    manage_messages=True,
+
+                    read_message_history=True
+
+                )
+
+        
+
+        channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites)
+
+        
+
+        # Save appeal in DB
+
+        appeal_id = await self._run_db(
+
+            self._create_appeal_sync,
+
+            guild.id,
+
+            channel.id,
+
+            user.id,
+
+            jailed["reason"],  # Use the actual jail reason
+
+        )
+
+        self.ticket_channel_cache.add(channel.id)
+
+        
+
+        # FIXED: Create better embed with jail reason
+
+        embed = discord.Embed(
+
+            title="📩 Jail Appeal",
+
+            description=f"Appeal for {user.mention} (`{user.id}`)",
+
+            color=discord.Color.blurple(),
+
+            timestamp=datetime.datetime.utcnow(),
+
+        )
+
+        embed.add_field(name="🔒 Original Jail Reason", value=jailed["reason"] or "No reason provided", inline=False)
+
+        embed.add_field(name="📝 Instructions", value="Please explain why you should be unjailed. Staff will review your appeal.", inline=False)
+
+        embed.set_footer(text=f"Appeal ID: {appeal_id} • Created at")
+
+        
+
+        # FIXED: Mention both admin role and user
+
+        mention_text = []
+
+        if admin_role:
+
+            mention_text.append(admin_role.mention)
+
+        mention_text.append(user.mention)
+
+        
+
+        await channel.send(
+
+            content=" ".join(mention_text),
+
+            embed=embed,
+
+            view=TicketActionView(self)
+
+        )
+
+        
+
+        await interaction.response.send_message(
+
+            f"✅ Appeal created: {channel.mention}",
+
+            ephemeral=True
+
+        )
+
+    # ------------------ BUTTON: APPROVE ------------------
+
+    async def handle_ticket_approve(self, interaction: discord.Interaction):
+
+        if not self._is_jail_admin(interaction.user):
+
+            return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+
+        
+
+        await interaction.response.defer()
+
+        channel = interaction.channel
+
+        guild = channel.guild
+
+        
+
+        # Find which user owns this appeal
+
+        def find_appeal(conn):
+
+            c = conn.cursor()
+
+            row = c.execute(
+
+                "SELECT * FROM appeals WHERE ticket_channel_id = ? AND status = 'open'",
+
+                (channel.id,)
+
+            ).fetchone()
+
+            return dict(row) if row else None
+
+        
+
+        appeal = await self._run_db(find_appeal)
+
+        if not appeal:
+
+            return await interaction.followup.send("❌ Appeal not found.")
+
+        
+
+        user = guild.get_member(appeal["user_id"])
+
+        if not user:
+
+            return await interaction.followup.send("❌ User not found in server.")
+
+        
+
+        # Unjail the user
+
+        try:
+
+            # Get jail config
+
+            cfg = await self._run_db(self._get_guild_config_sync, guild.id)
+
+            jail_role = guild.get_role(cfg["jail_role"]) if cfg else None
+
+            
+
+            # Get jailed user data
+
+            jailed = await self._run_db(self._get_jailed_user_sync, guild.id, user.id)
+
+            
+
+            if jailed:
+
+                # Remove jail role
+
+                if jail_role and jail_role in user.roles:
+
+                    await user.remove_roles(jail_role, reason=f"Appeal approved by {interaction.user}")
+
+                
+
+                # Restore previous roles
+
+                if jailed.get("previous_roles"):
+
+                    try:
+
+                        prev_roles = [guild.get_role(rid) for rid in json.loads(jailed["previous_roles"]) if guild.get_role(rid) and self._bot_role_position_ok(guild, guild.get_role(rid))]
+
+                        if prev_roles:
+
+                            await user.add_roles(*prev_roles, reason=f"Appeal approved by {interaction.user}")
+
+                    except Exception as e:
+
+                        logger.error(f"Failed to restore some roles: {e}")
+
+                
+
+                # Remove from DB
+
+                await self._run_db(self._remove_jailed_user_sync, guild.id, user.id)
+
+            
+
+            # Notify user
+
+            try:
+
+                await user.send(f"✅ Your appeal in {guild.name} has been **approved** by {interaction.user.mention}. You have been unjailed.")
+
+            except Exception:
+
+                pass
+
+                
+
+        except Exception as e:
+
+            logger.exception("Appeal approval failed")
+
+            return await interaction.followup.send(f"❌ Error during unjail: {e}")
+
+        
+
+        # Close appeal in DB
+
+        transcript_file = await self._make_transcript_file(channel, user.id, appeal["id"])
+
+        try:
+
+            with open(transcript_file, "r", encoding="utf-8") as f:
+
+                transcript_text = f.read()
+
+        except Exception:
+
+            transcript_text = "Failed to generate transcript"
+
+        
+
+        await self._run_db(self._close_appeal_sync, channel.id, "approved", transcript_text)
+
+        
+
+        # Clean up file
+
+        try:
+
+            os.remove(transcript_file)
+
+        except Exception:
+
+            pass
+
+        
+
+        await channel.send("✅ Appeal approved. Closing ticket in 5 seconds...")
+
+        await asyncio.sleep(5)
+
+        try:
+
+            await channel.delete()
+
+        except Exception:
+
+            logger.exception("Failed to delete appeal channel %s", channel.id)
+
+    # ------------------ BUTTON: DENY ------------------
+
+    async def handle_ticket_deny(self, interaction: discord.Interaction):
+
+        if not self._is_jail_admin(interaction.user):
+
+            return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+
+        
+
+        await interaction.response.defer()
+
+        channel = interaction.channel
+
+        guild = channel.guild
+
+        
+
+        # Find appeal
+
+        def find_appeal(conn):
+
+            c = conn.cursor()
+
+            row = c.execute(
+
+                "SELECT * FROM appeals WHERE ticket_channel_id = ? AND status = 'open'",
+
+                (channel.id,)
+
+            ).fetchone()
+
+            return dict(row) if row else None
+
+        
+
+        appeal = await self._run_db(find_appeal)
+
+        if not appeal:
+
+            return await interaction.followup.send("❌ Appeal not found.")
+
+        
+
+        user = guild.get_member(appeal["user_id"])
+
+        if user:
+
+            try:
+
+                await user.send(f"❌ Your appeal in {guild.name} has been **denied** by {interaction.user.mention}.")
+
+            except Exception:
+
+                pass
+
+        
+
+        # Generate transcript and close appeal
+
+        transcript_file = await self._make_transcript_file(channel, appeal["user_id"], appeal["id"])
+
+        try:
+
+            with open(transcript_file, "r", encoding="utf-8") as f:
+
+                transcript_text = f.read()
+
+        except Exception:
+
+            transcript_text = "Failed to generate transcript"
+
+        
+
+        await self._run_db(self._close_appeal_sync, channel.id, "denied", transcript_text)
+
+        
+
+        # Clean up file
+
+        try:
+
+            os.remove(transcript_file)
+
+        except Exception:
+
+            pass
+
+        
+
+        await channel.send("❌ Appeal denied. Closing ticket in 5 seconds...")
+
+        await asyncio.sleep(5)
+
+        try:
+
+            await channel.delete()
+
+        except Exception:
+
+            logger.exception("Failed to delete appeal channel %s", channel.id)
+
+    # ------------------ BUTTON: CLOSE ------------------
+
+    async def handle_ticket_close(self, interaction: discord.Interaction):
+
+        if not self._is_jail_admin(interaction.user):
+
+            return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+
+        
+
+        await interaction.response.defer()
+
+        channel = interaction.channel
+
+        
+
+        # Find appeal
+
+        def find_appeal(conn):
+
+            c = conn.cursor()
+
+            row = c.execute(
+
+                "SELECT * FROM appeals WHERE ticket_channel_id = ? AND status = 'open'",
+
+                (channel.id,)
+
+            ).fetchone()
+
+            return dict(row) if row else None
+
+        
+
+        appeal = await self._run_db(find_appeal)
+
+        if appeal:
+
+            # Generate transcript and close appeal
+
+            transcript_file = await self._make_transcript_file(channel, appeal["user_id"], appeal["id"])
+
+            try:
+
+                with open(transcript_file, "r", encoding="utf-8") as f:
+
+                    transcript_text = f.read()
+
+            except Exception:
+
+                transcript_text = "Failed to generate transcript"
+
+            
+
+            await self._run_db(self._close_appeal_sync, channel.id, "closed", transcript_text)
+
+            
+
+            # Clean up file
+
+            try:
+
+                os.remove(transcript_file)
+
+            except Exception:
+
+                pass
+
+        
+
+        await channel.send("🔒 Ticket closed by staff. This channel will delete in 5 seconds.")
+
+        await asyncio.sleep(5)
+
+        try:
+
+            await channel.delete()
+
+        except Exception:
+
+            logger.exception("Failed to delete appeal channel %s", channel.id)
+
+    # ------------------ COMMAND: .accept ------------------
+
+    @commands.command()
+
+    async def accept(self, ctx):
+
+        """Approve the appeal from inside the ticket."""
+
+        if not self._is_jail_admin(ctx.author):
+
+            return await ctx.send("❌ No permission.")
+
+        
+
+        # Create a minimal interaction-like object
+
+        class MockInteraction:
+
+            def __init__(self, ctx):
+
+                self.user = ctx.author
+
+                self.channel = ctx.channel
+
+                self.guild = ctx.guild
+
+                self.response = MockResponse()
+
+            
+
+            async def response_send_message(self, *args, **kwargs):
+
+                return await ctx.send(*args, **kwargs)
+
+        
+
+        class MockResponse:
+
+            async def send_message(self, *args, **kwargs):
+
+                return await ctx.send(*args, **kwargs)
+
+            async def defer(self):
+
+                pass
+
+        
+
+        mock_interaction = MockInteraction(ctx)
+
+        await self.handle_ticket_approve(mock_interaction)
+
+    # ------------------ COMMAND: .deny ------------------
+
+    @commands.command()
+
+    async def deny(self, ctx):
+
+        """Deny the appeal from inside the ticket."""
+
+        if not self._is_jail_admin(ctx.author):
+
+            return await ctx.send("❌ No permission.")
+
+        
+
+        class MockInteraction:
+
+            def __init__(self, ctx):
+
+                self.user = ctx.author
+
+                self.channel = ctx.channel
+
+                self.guild = ctx.guild
+
+                self.response = MockResponse()
+
+            
+
+            async def response_send_message(self, *args, **kwargs):
+
+                return await ctx.send(*args, **kwargs)
+
+        
+
+        class MockResponse:
+
+            async def send_message(self, *args, **kwargs):
+
+                return await ctx.send(*args, **kwargs)
+
+            async def defer(self):
+
+                pass
+
+        
+
+        mock_interaction = MockInteraction(ctx)
+
+        await self.handle_ticket_deny(mock_interaction)
+
 async def setup(bot: commands.Bot):
 
     await bot.add_cog(JailCog(bot))
-
